@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+twilio
+python-dotenv
+websockets
+pydantic
+sqlalchemy
+psycopg2-binary
