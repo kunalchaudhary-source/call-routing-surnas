@@ -1,12 +1,22 @@
+"""Voice IVR routes for Twilio webhook handling.
+
+New simplified flow:
+1. Greeting → Menu (General Inquiry / Try Near You / Price Request)
+2. General Inquiry or Try Near You → Product vs Category → Collect info → Connect
+3. Price Request → Collect Product ID → Connect
+"""
 from __future__ import annotations
 
 import re
 
 from fastapi import APIRouter, Request, Response
 from twilio.twiml.voice_response import Gather, VoiceResponse, Dial
+from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
 
 from backend.config import get_settings
 from backend.services import config_service
+from backend.services import gemini_service
 from backend.services.agent_selector import get_agent_candidates
 from backend.services.calls import ensure_call_from_twilio
 from backend.services.leads import (
@@ -14,341 +24,45 @@ from backend.services.leads import (
     get_lead_by_call_sid,
     link_lead_to_call,
     record_category_selection,
+    record_intent,
+    record_assist_type,
+    record_product_id,
+    record_description,
+    record_full_interaction,
+    record_caller_name,
+    get_caller_name,
+    get_caller_intent,
+    get_caller_description,
 )
-from backend.services.logger import log_event
+from backend.services.logger import log_event, logger as event_logger
 from backend.services.twilio_service import get_verified_numbers
+from backend.services.crm_service import create_lead_in_crm
 
 
 router = APIRouter()
 
 settings = get_settings()
 
-CATEGORY_BY_DIGIT = {
-    "1": "necklace",
-    "2": "bangles",
-    "3": "bracelets",
-    "4": "earrings",
-    "5": "curated combination",
-    "6": "accessories",
-    "7": "man jewellery",
-    "8": "ring",
-    "9": "vintage diamond",
-}
-
-CATEGORY_KEYWORDS = {
-    "necklace": ["necklace", "necklaces", "haar"],
-    "bangles": ["bangle", "bangles", "kada"],
-    "bracelets": ["bracelet", "bracelets"],
-    "earrings": ["earring", "earrings", "jhumka", "chandbali"],
-    "curated combination": ["curated", "combination", "set", "combo"],
-    "accessories": ["accessory", "accessories", "maang tikka", "kamarband"],
-    "man jewellery": ["man jewellery", "men jewellery", "men's jewellery", "mens jewellery", "man jewelry", "mens jewelry"],
-    "ring": ["ring", "rings"],
-    "vintage diamond": ["vintage", "vintage diamond", "antique diamond", "old diamond"],
-}
-
-CATEGORY_LABELS = {
-    "necklace": "necklaces",
-    "bangles": "bangles",
-    "bracelets": "bracelets",
-    "earrings": "earrings",
-    "curated combination": "curated combinations",
-    "accessories": "accessories",
-    "man jewellery": "man jewellery",
-    "ring": "rings",
-    "vintage diamond": "vintage diamonds",
-}
-
-SPOKEN_NUMBER_ALIASES = {
-    "1": ["1", "one", "won", "wan", "ek"],
-    "2": ["2", "two", "too", "tu", "do"],
-    "3": ["3", "three", "tree", "teen", "tin"],
-    "4": ["4", "four", "for", "phor", "char", "chaar"],
-    "5": ["5", "five", "faiv", "paanch", "panch"],
-    "6": ["6", "six", "sicks", "che", "chhe", "cheh"],
-    "7": ["7", "seven", "saavn", "saven"],
-    "8": ["8", "eight", "ait", "ate"],
-    "9": ["9", "nine", "nain"],
-}
-
-VOICE_BY_LANGUAGE = {
-    "hi-IN": "Polly.Aditi",
-    "en-IN": "Polly.Aditi",
-}
-
+# Voice configuration
+VOICE_NAME = "Polly.Aditi"
+LANGUAGE_CODE = "en-IN"
 SPEECH_RECOGNITION_LANGUAGE = "en-IN"
 
-
-@router.post("/voice")
-async def voice(request: Request) -> Response:
-    """Entry point for Twilio Voice webhook."""
-    form = await request.form()
-
-    call_sid = form.get("CallSid")
-    caller_country = form.get("CallerCountry")
-    from_number = form.get("From")
-
-    call = ensure_call_from_twilio(form)
-    if call:
-        link_lead_to_call(call_sid, call.id)
-
-    lead = get_lead_by_call_sid(call_sid)
-    # IVR should always speak in English; human agents may switch to Hindi as needed.
-    language_code = "en-IN"
-    # Force Indian-accented Polly voice for IVR
-    voice_name = "Polly.Aditi"
-
-    log_event(call_sid, "CALL_RECEIVED", {
-        "from": from_number,
-        "caller_country": caller_country,
-        "lead_context": {
-            "page_context": getattr(lead, "page_context", None),
-            "currency": getattr(lead, "currency", None),
-            "user_type": getattr(lead, "user_type", None),
-        },
-    })
-
-    # If website already told us the product/category, skip menu and connect straight away
-    if lead and lead.page_context == "product" and lead.selected_category:
-        log_event(call_sid, "DIRECT_CONNECT", {
-            "category": lead.selected_category,
-            "currency": lead.currency,
-        })
-        response = VoiceResponse()
-        response.say(
-            _confirmation_prompt(lead.selected_category, language_code),
-            voice=voice_name,
-            language=language_code,
-        )
-        _append_dial_instruction(response, call_sid, lead.selected_category, lead.currency, language_code, from_number)
-        return Response(content=str(response), media_type="application/xml")
-
-    return Response(
-        content=str(_build_category_prompt(language_code, voice_name)),
-        media_type="application/xml",
-    )
+# Twilio REST client for status lookups
+twilio_client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
 
 
-@router.post("/voice/category")
-async def voice_category(request: Request) -> Response:
-    """Handle category selection from DTMF or speech and connect to an agent."""
-    form = await request.form()
-    call_sid = form.get("CallSid")
-    digits = form.get("Digits")
-    speech_result = form.get("SpeechResult")
-    from_number = form.get("From")
-
-    lead = get_lead_by_call_sid(call_sid)
-    # IVR should always speak in English; human agents may switch to Hindi as needed.
-    language_code = "en-IN"
-    # Force Indian-accented Polly voice for IVR
-    voice_name = "Polly.Aditi"
-
-    category = _resolve_category(digits, speech_result)
-
-    if not category:
-        log_event(call_sid, "INVALID_SELECTION", {"digits": digits, "speech": speech_result})
-        response = _build_category_prompt(language_code, voice_name)
-        response.say(
-            config_service.get_ivr_prompt("invalid"),
-            voice=voice_name,
-            language=language_code,
-        )
-        response.redirect("/voice")
-        return Response(content=str(response), media_type="application/xml")
-
-    record_category_selection(call_sid, category)
-    log_event(call_sid, "CATEGORY_SELECTED", {"category": category, "digits": digits, "speech": speech_result})
-
-    response = VoiceResponse()
-    response.say(
-        _confirmation_prompt(category, language_code),
-        voice=voice_name,
-        language=language_code,
-    )
-    _append_dial_instruction(
-        response,
-        call_sid,
-        category,
-        getattr(lead, "currency", None),
-        language_code,
-        from_number,
-    )
-
-    return Response(content=str(response), media_type="application/xml")
-
-
-def _build_category_prompt(language_code: str, voice_name: str) -> VoiceResponse:
-    response = VoiceResponse()
-    response.say(config_service.get_voice_greeting(language_code), voice=voice_name, language=language_code)
-    gather = Gather(
-        input="dtmf speech",
-        action="/voice/category",
-        speech_timeout="auto",
-        barge_in=True,
-        speech_model="phone_call",
-        language=SPEECH_RECOGNITION_LANGUAGE,
-        timeout=6,
-        hints="necklace bangle bracelet earring curated combination accessories man jewellery ring vintage diamond",
-    )
-    gather.say(config_service.get_ivr_prompt("menu"), voice=voice_name, language=language_code)
-    response.append(gather)
-    response.say(config_service.get_ivr_prompt("reprompt"), voice=voice_name, language=language_code)
-    return response
-
-
-def _append_dial_instruction(
-    response: VoiceResponse,
-    call_sid: str,
-    category: str,
-    currency: str | None,
-    language_code: str | None,
-    incoming_number: str | None = None,
-) -> None:
-    # Get an ordered list of candidate phone numbers to try
-    candidates = get_agent_candidates(category, currency, limit=5)
-    log_event(call_sid, "ROUTING_CANDIDATES", {"category": category, "currency": currency, "candidates": candidates})
-
-    if not candidates:
-        # No agents configured in DB — do not fall back to environment-configured pools.
-        log_event(call_sid, "NO_AGENT_CONFIGURED", {"category": category, "currency": currency})
-        response.say(
-            _copy({
-                "en-IN": "No agents are configured. Please configure agent phone numbers in the database and try again later.",
-            }, language_code or "en-IN"),
-            voice=VOICE_BY_LANGUAGE.get(language_code or "en-IN"),
-            language=language_code or "en-IN",
-        )
-        return
-
-    # If operator configured verified-only outbound numbers (useful for Twilio trial accounts),
-    # filter candidates to avoid dialing unverified numbers that will fail immediately.
-    verified = getattr(settings, "VERIFIED_OUTBOUND_NUMBERS", [])
-    if not verified:
-        # No explicit list configured; try fetching verified numbers from Twilio account
-        verified = get_verified_numbers()
-
-    if verified:
-        filtered = [c for c in candidates if c in verified]
-        log_event(call_sid, "FILTERED_ROUTING_CANDIDATES", {"before": candidates, "after": filtered})
-        candidates = filtered
-
-    # If after filtering there are no dialable targets, inform the caller instead of attempting dial
-    if not candidates:
-        response.say(
-            _copy({
-                "en-IN": "Sorry — we cannot connect your call right now. Please try again later.",
-            }, language_code or "en-IN"),
-            voice=VOICE_BY_LANGUAGE.get(language_code or "en-IN"),
-            language=language_code or "en-IN",
-        )
-        return
-
-    # Announce connection attempt and use a 20s timeout so Twilio moves to the next candidate
-    CONNECTING_PROMPTS = {
-        "en-IN": "Please wait while we connect you to our expert.",
-    }
-    response.say(
-        _copy(CONNECTING_PROMPTS, language_code or "en-IN"),
-        voice=VOICE_BY_LANGUAGE.get(language_code or "en-IN"),
-        language=language_code or "en-IN",
-    )
-
-    # Build a Dial that times out after 20 seconds per attempt and tries candidates sequentially
-    # Choose a callerId (a Twilio-owned/verified number) to use as the outbound Caller ID.
-    caller_id = None
+def _get_prompt(key: str) -> str:
+    """Fetch IVR prompt from config and optionally filter it through Gemini."""
+    text = config_service.get_ivr_prompt(key)
     try:
-        available_verified = getattr(settings, "VERIFIED_OUTBOUND_NUMBERS", []) or get_verified_numbers()
+        return gemini_service.filter_text_if_enabled(text)
     except Exception:
-        available_verified = []
-
-    # Never consider the inbound caller's number as a valid callerId
-    if incoming_number and available_verified:
-        available_verified = [v for v in available_verified if v != incoming_number]
-
-    # Avoid using one of the dial candidates as the outbound callerId —
-    # callerId should be an account-owned number that is NOT the same as
-    # the destination we're dialing (Twilio may reject a callerId that
-    # equals the callee or that is DNO-listed).
-    if available_verified:
-        available_verified = [v for v in available_verified if v not in candidates]
-
-    # Log available verified numbers for debugging purposes
-    log_event(call_sid, "AVAILABLE_VERIFIED", {"available_verified": available_verified})
-
-    def _country_prefix(num: str) -> str:
-        if not num or not num.startswith("+"):
-            return ""
-        # crude country prefix detection for common cases
-        if num.startswith("+91"):
-            return "+91"
-        if num.startswith("+1"):
-            return "+1"
-        return num[:3]
-
-    # Prefer an explicit TWILIO_CALLER_ID (if configured and verified and not equal to a candidate)
-    preferred = getattr(settings, "TWILIO_CALLER_ID", None)
-    if preferred and available_verified and preferred in available_verified and preferred not in candidates:
-        caller_id = preferred
-        log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": caller_id, "reason": "preferred_twilio_caller_id"})
-    else:
-        # prefer a verified callerId that matches the first candidate's country
-        if available_verified:
-            cand_pref = _country_prefix(candidates[0])
-            match = next((v for v in available_verified if _country_prefix(v) == cand_pref), None)
-            candidate_choice = match or available_verified[0]
-            # If the chosen candidate_choice accidentally equals a destination
-            # (shouldn't after filtering above), guard and fall back to None.
-            if candidate_choice in candidates:
-                caller_id = None
-                log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": None, "reason": "chosen_verified_matches_candidate; falling_back"})
-            else:
-                caller_id = candidate_choice
-                log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": caller_id, "reason": "matched_by_country_or_first_available"})
-        else:
-            log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": None, "reason": "no_available_verified_numbers_after_filtering"})
-
-    dial = Dial(timeout=20, callerId=caller_id) if caller_id else Dial(timeout=20)
-    for num in candidates:
-        dial.number(num)
-
-    log_event(call_sid, "DIAL_ATTEMPT", {"candidates": candidates, "timeout": 20, "caller_id": caller_id})
-
-    response.append(dial)
-
-
-def _copy(mapping: dict[str, str], language_code: str) -> str:
-    return mapping.get(language_code, mapping["en-IN"])
-
-
-def _resolve_category(digits: str | None, speech: str | None) -> str | None:
-    # If caller pressed a key, prefer it
-    if digits and digits in CATEGORY_BY_DIGIT:
-        return CATEGORY_BY_DIGIT[digits]
-
-    transcript = _normalize_transcript(speech)
-
-    # Check for spoken number tokens
-    tokens = transcript.split()
-    for token in tokens:
-        for digit, aliases in SPOKEN_NUMBER_ALIASES.items():
-            if token in aliases:
-                return CATEGORY_BY_DIGIT.get(digit)
-
-    # Look for phrases like "option one" or "number 3"
-    for digit, aliases in SPOKEN_NUMBER_ALIASES.items():
-        for alias in aliases:
-            if alias and alias in transcript:
-                return CATEGORY_BY_DIGIT.get(digit)
-
-    # Fallback: look for category keywords in the transcript
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(keyword in transcript for keyword in keywords):
-            return category
-    return None
+        return text
 
 
 def _normalize_transcript(text: str | None) -> str:
+    """Normalize speech transcript for matching."""
     if not text:
         return ""
     lowered = text.lower()
@@ -357,7 +71,687 @@ def _normalize_transcript(text: str | None) -> str:
     return lowered
 
 
-def _confirmation_prompt(category: str, language_code: str) -> str:
-    template = config_service.get_ivr_prompt("confirmation")
-    label = CATEGORY_LABELS.get(category, category)
-    return template.replace("{{category}}", label)
+# ==================== ENTRY POINT ====================
+
+@router.post("/voice")
+async def voice(request: Request) -> Response:
+    """Entry point for Twilio Voice webhook - greeting + main menu."""
+    form = await request.form()
+
+    call_sid = form.get("CallSid")
+    caller_country = form.get("CallerCountry")
+    from_number = form.get("From")
+
+    # Create/update call record
+    call = ensure_call_from_twilio(form)
+    if call:
+        link_lead_to_call(call_sid, call.id)
+
+    log_event(call_sid, "CALL_RECEIVED", {
+        "from": from_number,
+        "caller_country": caller_country,
+    })
+
+    # Build greeting + menu prompt
+    response = VoiceResponse()
+    
+    # Say greeting
+    greeting = config_service.get_voice_greeting(LANGUAGE_CODE)
+    response.say(greeting, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    
+    # Gather for intent selection (speech only, no DTMF required)
+    gather = Gather(
+        input="speech",
+        action="/voice/intent",
+        speech_timeout="auto",
+        barge_in=True,
+        speech_model="phone_call",
+        language=SPEECH_RECOGNITION_LANGUAGE,
+        timeout=8,
+        hints="general inquiry, try near you, price request, general, inquiry, store, price, pricing",
+    )
+    menu_text = _get_prompt("menu")
+    log_event(call_sid, "IVR_SAY", {"prompt": "menu", "message": menu_text})
+    gather.say(menu_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    response.append(gather)
+    
+    # If no input, reprompt
+    response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
+    response.redirect("/voice")
+    
+    return Response(content=str(response), media_type="application/xml")
+
+
+# ==================== INTENT SELECTION ====================
+
+@router.post("/voice/intent")
+async def voice_intent(request: Request) -> Response:
+    """Handle the initial intent choice: general inquiry / try near you / price request.
+    
+    After capturing intent, ask for caller's name before continuing.
+    """
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    speech_result = form.get("SpeechResult")
+    from_number = form.get("From")
+
+    log_event(call_sid, "INTENT_SPEECH_RECEIVED", {"speech": speech_result})
+
+    intent = _resolve_intent(speech_result)
+    
+    if not intent:
+        # Could not determine intent - use default agent
+        log_event(call_sid, "INTENT_NOT_RECOGNIZED", {"speech": speech_result})
+        record_intent(call_sid, "unknown")
+        return _connect_to_default_agent(call_sid, from_number)
+
+    # Persist choice
+    record_intent(call_sid, intent)
+    log_event(call_sid, "INTENT_SELECTED", {"intent": intent, "speech": speech_result})
+
+    # Ask for caller's name before continuing
+    response = VoiceResponse()
+    gather = Gather(
+        input="speech",
+        action="/voice/name",
+        speech_timeout="auto",
+        barge_in=True,
+        speech_model="phone_call",
+        language=SPEECH_RECOGNITION_LANGUAGE,
+        timeout=8,
+    )
+    name_text = _get_prompt("name_prompt")
+    log_event(call_sid, "IVR_SAY", {"prompt": "name_prompt", "message": name_text})
+    gather.say(name_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    response.append(gather)
+    
+    # If no name provided, continue anyway
+    response.redirect("/voice/name-fallback")
+    return Response(content=str(response), media_type="application/xml")
+
+
+# ==================== NAME COLLECTION ====================
+
+@router.post("/voice/name")
+async def voice_name(request: Request) -> Response:
+    """Collect caller's name and continue based on their selected intent."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    speech_result = form.get("SpeechResult")
+    from_number = form.get("From")
+
+    caller_name = (speech_result or "").strip()
+    
+    if caller_name:
+        record_caller_name(call_sid, caller_name)
+        log_event(call_sid, "CALLER_NAME_CAPTURED", {"name": caller_name})
+    else:
+        log_event(call_sid, "CALLER_NAME_NOT_PROVIDED", {})
+
+    # Get the stored intent and continue with appropriate flow
+    return await _continue_after_name(call_sid, from_number)
+
+
+@router.post("/voice/name-fallback")
+async def voice_name_fallback(request: Request) -> Response:
+    """Continue without name if caller didn't provide one."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    from_number = form.get("From")
+
+    log_event(call_sid, "CALLER_NAME_SKIPPED", {})
+    return await _continue_after_name(call_sid, from_number)
+
+
+async def _continue_after_name(call_sid: str, from_number: str | None) -> Response:
+    """Continue the IVR flow based on stored intent after name collection."""
+    lead = get_lead_by_call_sid(call_sid)
+    intent = lead.extra_metadata.get("intent") if lead and lead.extra_metadata else None
+
+    response = VoiceResponse()
+    
+    if intent in ("general_inquiry", "store"):
+        # Ask product vs category
+        gather = Gather(
+            input="speech",
+            action="/voice/assist-type",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=8,
+            hints="product, category, specific product, product category, item, type",
+        )
+        assist_text = _get_prompt("assist_type_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "assist_type_prompt", "message": assist_text})
+        gather.say(assist_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+        
+        # If no input, connect to default agent
+        response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
+        _append_dial_instruction(response, call_sid, None, None, from_number)
+        return Response(content=str(response), media_type="application/xml")
+
+    # price_request - ask for product ID
+    if intent == "price_request":
+        gather = Gather(
+            input="speech",
+            action="/voice/price-product",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=10,
+        )
+        price_text = _get_prompt("price_product_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "price_product_prompt", "message": price_text})
+        gather.say(price_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+        
+        # If no input, connect to default agent
+        response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
+        _append_dial_instruction(response, call_sid, None, None, from_number)
+        return Response(content=str(response), media_type="application/xml")
+
+    # Unknown intent - connect to default agent
+    return _connect_to_default_agent(call_sid, from_number)
+
+
+def _resolve_intent(speech: str | None) -> str | None:
+    """Resolve initial intent from speech.
+
+    Returns one of: "general_inquiry", "store", "price_request", or None
+    """
+    transcript = _normalize_transcript(speech)
+    if not transcript:
+        return None
+    
+    # price keywords
+    if any(k in transcript for k in ("price", "pricing", "cost", "rate", "price request")):
+        return "price_request"
+    
+    # store/try near you keywords
+    if any(k in transcript for k in ("store", "near", "nearby", "near you", "try near you", "try near", "location")):
+        return "store"
+    
+    # general inquiry keywords
+    if any(k in transcript for k in ("general", "inquiry", "enquiry", "help", "assist", "assistance", "general inquiry")):
+        return "general_inquiry"
+    
+    return None
+
+
+# ==================== ASSIST TYPE (PRODUCT VS CATEGORY) ====================
+
+@router.post("/voice/assist-type")
+async def voice_assist_type(request: Request) -> Response:
+    """Handle whether caller wants product-level help or category-level help."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    speech_result = form.get("SpeechResult")
+    from_number = form.get("From")
+
+    log_event(call_sid, "ASSIST_TYPE_SPEECH_RECEIVED", {"speech": speech_result})
+
+    choice = _resolve_assist_type(speech_result)
+    
+    if not choice:
+        # Could not determine - connect to default agent
+        log_event(call_sid, "ASSIST_TYPE_NOT_RECOGNIZED", {"speech": speech_result})
+        return _connect_to_default_agent(call_sid, from_number)
+
+    record_assist_type(call_sid, choice)
+    log_event(call_sid, "ASSIST_TYPE_SELECTED", {"assist_type": choice})
+
+    response = VoiceResponse()
+    
+    if choice == "product":
+        # Ask for product ID
+        gather = Gather(
+            input="speech",
+            action="/voice/product-id",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=10,
+        )
+        pid_text = _get_prompt("product_id_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "product_id_prompt", "message": pid_text})
+        gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+        
+        # If no input, connect to default agent
+        response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
+        _append_dial_instruction(response, call_sid, None, None, from_number)
+        return Response(content=str(response), media_type="application/xml")
+
+    # category - ask for category name
+    gather = Gather(
+        input="speech",
+        action="/voice/category-name",
+        speech_timeout="auto",
+        barge_in=True,
+        speech_model="phone_call",
+        language=SPEECH_RECOGNITION_LANGUAGE,
+        timeout=8,
+        hints="necklace, bangles, bracelets, earrings, rings, accessories",
+    )
+    cat_text = _get_prompt("category_prompt")
+    log_event(call_sid, "IVR_SAY", {"prompt": "category_prompt", "message": cat_text})
+    gather.say(cat_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    response.append(gather)
+    
+    # If no input, connect to default agent
+    response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
+    _append_dial_instruction(response, call_sid, None, None, from_number)
+    return Response(content=str(response), media_type="application/xml")
+
+
+def _resolve_assist_type(speech: str | None) -> str | None:
+    """Resolve whether caller wants product-level or category-level assistance."""
+    transcript = _normalize_transcript(speech)
+    if not transcript:
+        return None
+
+    # Prefer category when both tokens are present (e.g., "product category")
+    has_product = any(k in transcript for k in ("product", "id", "item", "sku", "specific"))
+    has_category = any(k in transcript for k in ("category", "categories", "type", "kind"))
+
+    if has_category and has_product:
+        return "category"
+    if has_category:
+        return "category"
+    if has_product:
+        return "product"
+    return None
+
+
+# ==================== PRODUCT ID COLLECTION ====================
+
+@router.post("/voice/product-id")
+async def voice_product_id(request: Request) -> Response:
+    """Collect product ID and connect to agent."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    speech_result = form.get("SpeechResult")
+    from_number = form.get("From")
+
+    product_id = (speech_result or "").strip()
+    
+    if product_id:
+        record_product_id(call_sid, product_id)
+        log_event(call_sid, "PRODUCT_ID_CAPTURED", {"product_id": product_id})
+    else:
+        log_event(call_sid, "PRODUCT_ID_NOT_PROVIDED", {})
+
+    # Ask for brief description then connect
+    response = VoiceResponse()
+    gather = Gather(
+        input="speech",
+        action="/voice/description",
+        speech_timeout="auto",
+        barge_in=False,
+        speech_model="phone_call",
+        language=SPEECH_RECOGNITION_LANGUAGE,
+        timeout=10,
+    )
+    conf_text = _get_prompt("confirmation")
+    log_event(call_sid, "IVR_SAY", {"prompt": "confirmation", "message": conf_text})
+    gather.say(conf_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    response.append(gather)
+    
+    # If no description, proceed to dial
+    _append_dial_instruction(response, call_sid, None, None, from_number)
+    return Response(content=str(response), media_type="application/xml")
+
+
+# ==================== PRICE PRODUCT COLLECTION ====================
+
+@router.post("/voice/price-product")
+async def voice_price_product(request: Request) -> Response:
+    """Collect product ID for pricing and connect to agent."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    speech_result = form.get("SpeechResult")
+    from_number = form.get("From")
+
+    product_id = (speech_result or "").strip()
+    
+    if product_id:
+        record_product_id(call_sid, product_id)
+        log_event(call_sid, "PRICE_PRODUCT_ID_CAPTURED", {"product_id": product_id})
+    else:
+        log_event(call_sid, "PRICE_PRODUCT_ID_NOT_PROVIDED", {})
+
+    # Ask for brief description then connect
+    response = VoiceResponse()
+    gather = Gather(
+        input="speech",
+        action="/voice/description",
+        speech_timeout="auto",
+        barge_in=False,
+        speech_model="phone_call",
+        language=SPEECH_RECOGNITION_LANGUAGE,
+        timeout=10,
+    )
+    gather.say(_get_prompt("confirmation"), voice=VOICE_NAME, language=LANGUAGE_CODE)
+    response.append(gather)
+    
+    # If no description, proceed to dial
+    _append_dial_instruction(response, call_sid, None, None, from_number)
+    return Response(content=str(response), media_type="application/xml")
+
+
+# ==================== CATEGORY NAME COLLECTION ====================
+
+@router.post("/voice/category-name")
+async def voice_category_name(request: Request) -> Response:
+    """Collect category name and connect to agent."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    speech_result = form.get("SpeechResult")
+    from_number = form.get("From")
+
+    category = (speech_result or "").strip()
+    
+    if category:
+        record_category_selection(call_sid, category)
+        log_event(call_sid, "CATEGORY_NAME_CAPTURED", {"category": category})
+    else:
+        log_event(call_sid, "CATEGORY_NAME_NOT_PROVIDED", {})
+
+    # Directly route to agent and sync CRM using collected data
+    lead = get_lead_by_call_sid(call_sid)
+    selected_category = category if category else getattr(lead, "selected_category", None)
+
+    # Ensure CRM lead is sent even if /voice/description is never hit
+    _sync_crm_lead_for_call(call_sid, from_number, None)
+
+    response = VoiceResponse()
+    _append_dial_instruction(response, call_sid, selected_category, getattr(lead, "currency", None), from_number)
+    return Response(content=str(response), media_type="application/xml")
+
+
+# ==================== DESCRIPTION COLLECTION ====================
+
+@router.post("/voice/description")
+async def voice_description(request: Request) -> Response:
+    """Collect caller description, create CRM lead, and connect to agent."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    speech_result = form.get("SpeechResult")
+    from_number = form.get("From")
+
+    description = (speech_result or "").strip()
+    
+    if description:
+        record_description(call_sid, description)
+        log_event(call_sid, "CALLER_DESCRIPTION_CAPTURED", {"description": description})
+
+    # Get all collected lead data
+    lead = get_lead_by_call_sid(call_sid)
+    category = getattr(lead, "selected_category", None)
+    product_id = getattr(lead, "product_id", None)
+    
+    # Get stored data from extra_metadata
+    caller_name = None
+    intent = None
+    caller_description = description
+    if lead and lead.extra_metadata:
+        caller_name = lead.extra_metadata.get("caller_name")
+        intent = lead.extra_metadata.get("intent")
+        if not caller_description:
+            caller_description = lead.extra_metadata.get("caller_description")
+
+    # Create/update CRM lead before routing
+    _sync_crm_lead_for_call(call_sid, from_number, caller_description)
+
+    # Connect to agent
+    response = VoiceResponse()
+    _append_dial_instruction(response, call_sid, category, getattr(lead, "currency", None), from_number)
+    return Response(content=str(response), media_type="application/xml")
+
+
+# ==================== HELPER FUNCTIONS ====================
+
+def _sync_crm_lead_for_call(call_sid: str, from_number: str | None, override_description: str | None = None) -> None:
+    """Ensure a single CRM lead is created for this call using stored answers.
+
+    Called right before routing to a human so that all collected IVR data
+    (intent, name, category/product, description) is sent to CRM.
+    """
+    # Avoid duplicate CRM leads: if we've already synced one for this call, skip
+    from backend.db import SessionLocal
+    from backend.models.db_models import Call, CallEvent
+    from datetime import datetime
+
+    db = SessionLocal()
+    try:
+        call = db.query(Call).filter_by(twilio_call_sid=call_sid).one_or_none()
+        if call:
+            existing = db.query(CallEvent).filter(
+                CallEvent.call_id == call.id,
+                CallEvent.event_type.in_(["CRM_LEAD_CREATED", "CRM_LEAD_SYNCED"]),
+            ).first()
+            if existing:
+                return
+    except Exception:
+        # If we can't check, continue and attempt to create
+        pass
+    finally:
+        db.close()
+
+    # Gather latest lead data
+    lead = get_lead_by_call_sid(call_sid)
+    category = getattr(lead, "selected_category", None)
+    product_id = getattr(lead, "product_id", None)
+
+    caller_name = None
+    intent = None
+    caller_description = override_description
+    if lead and lead.extra_metadata:
+        caller_name = lead.extra_metadata.get("caller_name")
+        intent = lead.extra_metadata.get("intent")
+        if not caller_description:
+            caller_description = lead.extra_metadata.get("caller_description")
+
+    # Fallback: if caller_name is still missing, read it from the last
+    # CALLER_NAME_CAPTURED event for this call so CRM always sees the name
+    if not caller_name:
+        from backend.db import SessionLocal as _SessionLocal
+        from backend.models.db_models import Call as _Call, CallEvent as _CallEvent
+        db2 = _SessionLocal()
+        try:
+            call_row = db2.query(_Call).filter_by(twilio_call_sid=call_sid).one_or_none()
+            q = db2.query(_CallEvent).filter(_CallEvent.event_type == "CALLER_NAME_CAPTURED")
+            if call_row:
+                q = q.filter(_CallEvent.call_id == call_row.id)
+            q = q.order_by(_CallEvent.created_at.desc())
+            ev = q.first()
+            if ev and isinstance(ev.event_payload, dict):
+                caller_name = ev.event_payload.get("name") or caller_name
+        finally:
+            db2.close()
+
+    try:
+        crm_lead_id = create_lead_in_crm(
+            call_sid=call_sid,
+            caller_name=caller_name,
+            mobile_phone=from_number,
+            intent=intent,
+            product_id=product_id,
+            category=category,
+            description=caller_description,
+        )
+        if crm_lead_id:
+            log_event(call_sid, "CRM_LEAD_SYNCED", {"lead_id": crm_lead_id})
+            try:
+                event_logger.info(f"CRM_LEAD_SENT: call_sid={call_sid} lead_id={crm_lead_id}")
+            except Exception:
+                # Last-resort console hint
+                print({"call_sid": call_sid, "event": "CRM_LEAD_SENT", "lead_id": crm_lead_id})
+    except Exception as e:
+        log_event(call_sid, "CRM_LEAD_ERROR", {"error": str(e)})
+
+def _connect_to_default_agent(call_sid: str, from_number: str | None) -> Response:
+    """Connect to default agent when no specific category/intent is selected.
+    
+    Other than persisting to Postgres, this path does NOT create a CRM lead.
+    """
+    log_event(call_sid, "CONNECTING_TO_DEFAULT_AGENT", {})
+
+    response = VoiceResponse()
+    conn_text = _get_prompt("connecting")
+    log_event(call_sid, "IVR_SAY", {"prompt": "connecting", "message": conn_text})
+    response.say(conn_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    _append_dial_instruction(response, call_sid, None, None, from_number)
+    return Response(content=str(response), media_type="application/xml")
+
+
+def _append_dial_instruction(
+    response: VoiceResponse,
+    call_sid: str,
+    category: str | None,
+    currency: str | None,
+    incoming_number: str | None = None,
+) -> None:
+    """Append dial instruction to connect to appropriate agent."""
+    # Get an ordered list of candidate phone numbers to try
+    candidates = get_agent_candidates(category, currency, limit=5)
+    log_event(call_sid, "ROUTING_CANDIDATES", {"category": category, "currency": currency, "candidates": candidates})
+
+    if not candidates:
+        # No agents configured
+        log_event(call_sid, "NO_AGENT_CONFIGURED", {"category": category, "currency": currency})
+        response.say(
+            _get_prompt("no_agent"),
+            voice=VOICE_NAME,
+            language=LANGUAGE_CODE,
+        )
+        return
+
+    # Filter to verified numbers if configured
+    verified = getattr(settings, "VERIFIED_OUTBOUND_NUMBERS", [])
+    if not verified:
+        verified = get_verified_numbers()
+
+    if verified:
+        filtered = [c for c in candidates if c in verified]
+        log_event(call_sid, "FILTERED_ROUTING_CANDIDATES", {"before": candidates, "after": filtered})
+        candidates = filtered
+
+    if not candidates:
+        response.say(
+            _get_prompt("no_agent"),
+            voice=VOICE_NAME,
+            language=LANGUAGE_CODE,
+        )
+        return
+
+    # Announce connection
+    response.say(_get_prompt("connecting"), voice=VOICE_NAME, language=LANGUAGE_CODE)
+
+    # Choose caller ID
+    caller_id = _get_caller_id(candidates, incoming_number)
+    log_event(call_sid, "DIAL_ATTEMPT", {"candidates": candidates, "timeout": 20, "caller_id": caller_id})
+    try:
+        event_logger.info(f"ROUTING_BEGIN: call_sid={call_sid} candidates={candidates} caller_id={caller_id}")
+    except Exception:
+        print({"call_sid": call_sid, "event": "ROUTING_BEGIN", "candidates": candidates, "caller_id": caller_id})
+
+    # Build dial instruction
+    # Include action callback so we can log status after the dial finishes
+    dial = Dial(timeout=20, callerId=caller_id, action="/voice/dial-complete", method="POST") if caller_id else Dial(timeout=20, action="/voice/dial-complete", method="POST")
+    for num in candidates:
+        dial.number(num)
+
+    response.append(dial)
+
+
+@router.post("/voice/dial-complete")
+async def voice_dial_complete(request: Request) -> Response:
+    """Twilio calls this after <Dial> finishes to report status.
+
+    Logs which agent number was connected, status, and duration.
+    """
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    dial_call_sid = form.get("DialCallSid")
+    dial_status = form.get("DialCallStatus")
+    dial_duration = form.get("DialCallDuration")
+
+    to_number = None
+    try:
+        if dial_call_sid:
+            c = twilio_client.calls(dial_call_sid).fetch()
+            to_number = getattr(c, "to", None)
+    except TwilioRestException as tre:
+        log_event(call_sid, "TWILIO_DIAL_CALL_FETCH_FAILED", {"status": tre.status, "code": tre.code, "msg": str(tre), "dial_call_sid": dial_call_sid})
+    except Exception as exc:
+        log_event(call_sid, "TWILIO_DIAL_CALL_FETCH_ERROR", {"error": str(exc), "dial_call_sid": dial_call_sid})
+
+    # Try to map number to agent in DB
+    agent_info = None
+    if to_number:
+        try:
+            from backend.db import SessionLocal
+            from backend.models.db_models import Agent
+            db = SessionLocal()
+            try:
+                agent = db.query(Agent).filter(Agent.phone_number == to_number).one_or_none()
+                if agent:
+                    agent_info = {"agent_id": agent.id, "name": agent.name, "region": agent.region, "phone_number": agent.phone_number}
+            finally:
+                db.close()
+        except Exception as exc:
+            log_event(call_sid, "AGENT_LOOKUP_ERROR", {"error": str(exc), "phone_number": to_number})
+
+    log_event(call_sid, "DIAL_COMPLETED", {
+        "dial_call_sid": dial_call_sid,
+        "status": dial_status,
+        "duration": dial_duration,
+        "to": to_number,
+        "agent": agent_info,
+    })
+
+    # No further IVR action — this is just a logging callback
+    return Response(content=str(VoiceResponse()), media_type="application/xml")
+
+
+def _get_caller_id(candidates: list[str], incoming_number: str | None) -> str | None:
+    """Determine the best caller ID to use for outbound dialing."""
+    try:
+        available_verified = getattr(settings, "VERIFIED_OUTBOUND_NUMBERS", []) or get_verified_numbers()
+    except Exception:
+        available_verified = []
+
+    # Exclude the incoming caller's number
+    if incoming_number and available_verified:
+        available_verified = [v for v in available_verified if v != incoming_number]
+
+    # Exclude candidates (don't dial same number as caller ID)
+    if available_verified:
+        available_verified = [v for v in available_verified if v not in candidates]
+
+    # Prefer explicit TWILIO_CALLER_ID
+    preferred = getattr(settings, "TWILIO_CALLER_ID", None)
+    if preferred and available_verified and preferred in available_verified and preferred not in candidates:
+        return preferred
+
+    # Use first available verified number matching candidate country
+    if available_verified and candidates:
+        def _country_prefix(num: str) -> str:
+            if not num or not num.startswith("+"):
+                return ""
+            if num.startswith("+91"):
+                return "+91"
+            if num.startswith("+1"):
+                return "+1"
+            return num[:3]
+
+        cand_pref = _country_prefix(candidates[0])
+        match = next((v for v in available_verified if _country_prefix(v) == cand_pref), None)
+        return match or available_verified[0]
+
+    return None

@@ -90,6 +90,170 @@ def record_category_selection(call_sid: str, category: str) -> Optional[CallLead
         db.close()
 
 
+def record_intent(call_sid: str, intent: str) -> Optional[CallLead]:
+    """Record the caller's top-level intent (general_inquiry / store / price_request)."""
+    db = SessionLocal()
+    try:
+        lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
+        if not lead:
+            lead = CallLead(call_sid=call_sid)
+
+        extra = lead.extra_metadata or {}
+        extra["intent"] = intent
+        lead.extra_metadata = extra
+
+        db.add(lead)
+        db.commit()
+        db.refresh(lead)
+        return lead
+    finally:
+        db.close()
+
+
+def record_assist_type(call_sid: str, assist_type: str) -> Optional[CallLead]:
+    """Record whether the caller wants help with a specific product or a category.
+
+    `assist_type` should be either 'product' or 'category'.
+    """
+    db = SessionLocal()
+    try:
+        lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
+        if not lead:
+            lead = CallLead(call_sid=call_sid)
+
+        extra = lead.extra_metadata or {}
+        extra["assist_type"] = assist_type
+        lead.extra_metadata = extra
+
+        db.add(lead)
+        db.commit()
+        db.refresh(lead)
+        return lead
+    finally:
+        db.close()
+
+
+def record_product_id(call_sid: str, product_id: str) -> Optional[CallLead]:
+    """Store the provided Product ID on the call lead."""
+    db = SessionLocal()
+    try:
+        lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
+        if not lead:
+            lead = CallLead(call_sid=call_sid)
+
+        lead.product_id = product_id
+        db.add(lead)
+        db.commit()
+        db.refresh(lead)
+        return lead
+    finally:
+        db.close()
+
+
+def record_description(call_sid: str, description: str) -> Optional[CallLead]:
+    """Store a short free-text description the caller gave before handoff."""
+    db = SessionLocal()
+    try:
+        lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
+        if not lead:
+            lead = CallLead(call_sid=call_sid)
+
+        extra = lead.extra_metadata or {}
+        extra["caller_description"] = description
+        lead.extra_metadata = extra
+
+        db.add(lead)
+        db.commit()
+        db.refresh(lead)
+        return lead
+    finally:
+        db.close()
+
+
+def record_caller_name(call_sid: str, caller_name: str) -> Optional[CallLead]:
+    """Store the caller's name (from IVR question)."""
+    db = SessionLocal()
+    try:
+        lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
+        if not lead:
+            lead = CallLead(call_sid=call_sid)
+
+        extra = lead.extra_metadata or {}
+        extra["caller_name"] = caller_name
+        lead.extra_metadata = extra
+
+        db.add(lead)
+        db.commit()
+        db.refresh(lead)
+        return lead
+    finally:
+        db.close()
+
+
+def get_caller_name(call_sid: str) -> Optional[str]:
+    """Retrieve the caller's name from the lead."""
+    lead = get_lead_by_call_sid(call_sid)
+    if lead and lead.extra_metadata:
+        return lead.extra_metadata.get("caller_name")
+    return None
+
+
+def get_caller_intent(call_sid: str) -> Optional[str]:
+    """Retrieve the caller's intent from the lead."""
+    lead = get_lead_by_call_sid(call_sid)
+    if lead and lead.extra_metadata:
+        return lead.extra_metadata.get("intent")
+    return None
+
+
+def get_caller_description(call_sid: str) -> Optional[str]:
+    """Retrieve the caller's description from the lead."""
+    lead = get_lead_by_call_sid(call_sid)
+    if lead and lead.extra_metadata:
+        return lead.extra_metadata.get("caller_description")
+    return None
+
+
+def record_full_interaction(call_sid: str, *, intent: str | None = None, assist_type: str | None = None, product_id: str | None = None, product_category: str | None = None, description: str | None = None) -> Optional[CallLead]:
+    """Convenience helper to record multiple values at once on the CallLead.
+
+    Only non-None values are written.
+    """
+    db = SessionLocal()
+    try:
+        lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
+        if not lead:
+            lead = CallLead(call_sid=call_sid)
+
+        if intent is not None:
+            extra = lead.extra_metadata or {}
+            extra["intent"] = intent
+            lead.extra_metadata = extra
+
+        if assist_type is not None:
+            extra = lead.extra_metadata or {}
+            extra["assist_type"] = assist_type
+            lead.extra_metadata = extra
+
+        if product_id is not None:
+            lead.product_id = product_id
+
+        if product_category is not None:
+            lead.selected_category = product_category.lower()
+
+        if description is not None:
+            extra = lead.extra_metadata or {}
+            extra["caller_description"] = description
+            lead.extra_metadata = extra
+
+        db.add(lead)
+        db.commit()
+        db.refresh(lead)
+        return lead
+    finally:
+        db.close()
+
+
 def link_lead_to_call(call_sid: str, call_id: Optional[str]) -> None:
     if not call_id:
         return

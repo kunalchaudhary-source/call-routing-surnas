@@ -52,16 +52,40 @@ DEFAULT_CORRECTIONS = {
 
 DEFAULT_GREETINGS = {
     # Unified greeting for both Hindi and English per request
-    "hi-IN": "noneed to diffrent type of greeting meessages",
-    "en-IN": "noneed to diffrent type of greeting meessages",
+    "hi-IN": "Namaste, welcome to Jadau.",
+    "en-IN": "Namaste, welcome to Jadau.",
 }
 
 
 # Default IVR prompts (English only) used by the voice IVR.
 # These can be overridden via the admin console.
 DEFAULT_IVR_PROMPTS = {
-    "menu": "Please say the category you need help with — for example necklace, bangles, bracelets, earrings, curated combination, or accessories.",
-    "reprompt": "I did not catch a valid choice. Please say a category name like necklace or earrings.",
-    "confirmation": "Connecting you with a {{category}} expert now.",
-    "invalid": "Sorry, that option is not available. Please choose again.",
+    # Main menu - intent selection
+    "menu": "Please choose one of the following options: General Inquiry, Try Near You, or Price Request.",
+    "reprompt": "I did not catch your response. Please say General Inquiry, Try Near You, or Price Request.",
+    "invalid": "Sorry, I didn't understand that. Please try again.",
+    
+    # Name collection - asked after intent selection
+    "name_prompt": "May I have your name please, so that we can provide you with more specific assistance?",
+    
+    # After General Inquiry or Try Near You - product or category
+    "assist_type_prompt": "Would you like assistance with a specific product or a product category?",
+    
+    # Product ID collection
+    "product_id_prompt": "Please provide the Product ID for the item you're referring to.",
+    
+    # Category name collection  
+    "category_prompt": "Kindly mention the category name you're looking for.",
+    
+    # Price request - ask for product ID
+    "price_product_prompt": "Please provide the Product ID so I can check the pricing details for you.",
+    
+    # Confirmation before connecting to agent
+    "confirmation": "Thank you. While I connect you to our agent for further assistance, please briefly describe your query.",
+    
+    # Connection announcement
+    "connecting": "Please wait while we connect you to our expert.",
+    
+    # Default fallback message when no agent available
+    "no_agent": "Sorry, we cannot connect your call right now. Please try again later.",
 }

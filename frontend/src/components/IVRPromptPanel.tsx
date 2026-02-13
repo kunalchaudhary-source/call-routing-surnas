@@ -3,13 +3,46 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../services/api";
 import { IVRPromptRecord } from "../types";
 
-const PROMPT_KEYS = ["menu", "reprompt", "confirmation", "invalid"] as const;
+const PROMPT_KEYS = [
+  "menu",
+  "reprompt",
+  "invalid",
+  "name_prompt",
+  "assist_type_prompt",
+  "product_id_prompt",
+  "category_prompt",
+  "price_product_prompt",
+  "confirmation",
+  "connecting",
+  "no_agent",
+] as const;
 
 const PROMPT_LABELS: Record<(typeof PROMPT_KEYS)[number], string> = {
-  menu: "Menu Prompt",
+  menu: "Main Menu (Intent Selection)",
   reprompt: "Reprompt (no input / unclear)",
-  confirmation: "Confirmation (before connecting)",
-  invalid: "Invalid selection message",
+  invalid: "Invalid Selection Message",
+  name_prompt: "Caller Name Request",
+  assist_type_prompt: "Product vs Category Question",
+  product_id_prompt: "Product ID Request",
+  category_prompt: "Category Name Request",
+  price_product_prompt: "Price Request - Product ID",
+  confirmation: "Confirmation + Description Request",
+  connecting: "Connecting to Agent",
+  no_agent: "No Agent Available",
+};
+
+const PROMPT_DESCRIPTIONS: Record<(typeof PROMPT_KEYS)[number], string> = {
+  menu: "Asks user to choose: General Inquiry, Try Near You, or Price Request",
+  reprompt: "Played when user doesn't respond or speaks unclearly",
+  invalid: "Played when user's response is not understood",
+  name_prompt: "Asks caller for their name to provide personalized assistance",
+  assist_type_prompt: "Asks if user wants help with a specific product or category",
+  product_id_prompt: "Asks user to provide the Product ID",
+  category_prompt: "Asks user to mention the category name",
+  price_product_prompt: "Asks user for Product ID (for pricing queries)",
+  confirmation: "Thanks user and asks for brief query description before connecting",
+  connecting: "Announcement before connecting to agent",
+  no_agent: "Message when no agent is available",
 };
 
 export function IVRPromptPanel() {
@@ -63,18 +96,19 @@ export function IVRPromptPanel() {
   return (
     <SectionShell
       title="IVR Prompts"
-      subtitle="Control the English IVR messages for menu, reprompt, and confirmation"
+      subtitle="Configure the voice prompts for the IVR call flow. All responses are speech-based."
     >
       <div className="space-y-6">
         {PROMPT_KEYS.map((key) => (
           <div key={key} className="space-y-2">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-1">
               <p className="text-sm font-semibold text-onyx">{PROMPT_LABELS[key]}</p>
+              <p className="text-xs text-onyx/50">{PROMPT_DESCRIPTIONS[key]}</p>
             </div>
             <textarea
               value={drafts[key] ?? ""}
               onChange={(e) => setDrafts((prev) => ({ ...prev, [key]: e.target.value }))}
-              rows={key === "menu" ? 4 : 3}
+              rows={key === "menu" || key === "confirmation" ? 4 : 2}
               className="w-full glass-panel rounded-3xl p-4 font-sans text-sm text-onyx/80 focus:outline-none focus:ring-2 focus:ring-garnet"
             />
           </div>

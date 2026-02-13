@@ -29,7 +29,14 @@ CATEGORY_NORMALIZER = {
 }
 
 
-def _normalized_category(category: str) -> str:
+def _normalized_category(category: Optional[str]) -> str:
+    """Normalize a category name to the canonical form.
+
+    If `category` is None or empty, return an empty string so callers
+    will fall back to region/default agent selection instead of crashing.
+    """
+    if not category:
+        return ""
     return CATEGORY_NORMALIZER.get(category.lower().strip(), category.lower().strip())
 
 
@@ -39,7 +46,7 @@ def _region_from_currency(currency: Optional[str]) -> str:
     return "US"
 
 
-def pick_agent(category: str, currency: Optional[str]) -> Tuple[Optional[Agent], str]:
+def pick_agent(category: Optional[str], currency: Optional[str]) -> Tuple[Optional[Agent], str]:
     """Return the most qualified agent for the category plus fallback target number."""
     normalized_category = _normalized_category(category)
     region = _region_from_currency(currency)
@@ -80,7 +87,7 @@ def pick_agent(category: str, currency: Optional[str]) -> Tuple[Optional[Agent],
         db.close()
 
 
-def get_agent_candidates(category: str, currency: Optional[str], limit: int = 5) -> list[str]:
+def get_agent_candidates(category: Optional[str], currency: Optional[str], limit: int = 5) -> list[str]:
     """Return an ordered list of phone numbers to try for a category.
 
     The list is ordered by specialist proficiency, region defaults, and finally fallback pools.

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import Response, JSONResponse
 
-from backend.routes.voice import voice as voice_endpoint, voice_category as voice_category_endpoint
+from backend.routes.voice import voice as voice_endpoint, voice_category_name as voice_category_endpoint
 from backend.services.logger import log_event
 
 

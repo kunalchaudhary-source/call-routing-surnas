@@ -311,7 +311,26 @@ def seed_default_agents() -> None:
 
 def initialize_config() -> None:
     """Initialize all default config on startup."""
+    # Avoid running initialization twice when Uvicorn reload spawns multiple processes.
+    # If another process has recently refreshed the config, skip doing it again.
+    from datetime import datetime, timedelta
+    from backend.db import SessionLocal
+    from backend.models.db_models import CallEvent
+
+    db = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(seconds=60)
+        exists = db.query(CallEvent).filter(CallEvent.event_type == "CONFIG_CACHE_REFRESHED", CallEvent.created_at >= cutoff).first()
+        if exists:
+            return
+    except Exception:
+        # If DB check fails, proceed with initialization to avoid missing seeds.
+        pass
+    finally:
+        db.close()
+
     seed_default_corrections()
     seed_default_agents()
     seed_default_greetings()
+    seed_default_ivr_prompts()
     refresh_cache(force=True)
