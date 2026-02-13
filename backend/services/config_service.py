@@ -299,32 +299,9 @@ def seed_default_agents() -> None:
         existing = db.query(Agent).count()
         if existing > 0:
             return
-        
-        from backend.config import get_settings
-        settings = get_settings()
-        
-        # Create default agents from config (or placeholders)
-        default_agents = [
-            {
-                "name": "India Support",
-                "phone_number": getattr(settings, "INDIA_AGENT_POOL", "+918077164213"),
-                "region": "IN",
-                "is_default": True,
-            },
-            {
-                "name": "US Support", 
-                "phone_number": getattr(settings, "US_AGENT_POOL", "+1XXXXXXXXXX"),
-                "region": "US",
-                "is_default": True,
-            },
-        ]
-        
-        for agent_data in default_agents:
-            agent = Agent(**agent_data)
-            db.add(agent)
-        
-        db.commit()
-        log_event(None, "AGENTS_SEEDED", {"count": len(default_agents)})
+        # Do NOT seed placeholder agents from environment variables.
+        # Operators must configure agents in the database explicitly.
+        log_event(None, "NO_AGENTS_CONFIGURED_IN_DB", {"message": "No agents found in DB. Please configure agents in the database."})
     except Exception as e:
         log_event(None, "AGENTS_SEED_ERROR", {"error": str(e)})
         db.rollback()

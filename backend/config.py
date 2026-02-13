@@ -43,6 +43,9 @@ class Settings:
         self.US_SUPPORT_QUEUE_SID: Optional[str] = os.getenv("US_SUPPORT_QUEUE_SID")
         self.INDIA_SUPPORT_QUEUE_SID: Optional[str] = os.getenv("INDIA_SUPPORT_QUEUE_SID")
 
+        # Prefer this verified Twilio number for outbound Caller ID when set
+        self.TWILIO_CALLER_ID: Optional[str] = os.getenv("TWILIO_CALLER_ID")
+
         # Basic validation
         if not self.DATABASE_URL:
             raise RuntimeError("DATABASE_URL environment variable is required")

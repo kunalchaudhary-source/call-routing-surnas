@@ -7,7 +7,7 @@ from twilio.twiml.voice_response import Gather, VoiceResponse, Dial
 
 from backend.config import get_settings
 from backend.services import config_service
-from backend.services.agent_selector import pick_agent, get_agent_candidates
+from backend.services.agent_selector import get_agent_candidates
 from backend.services.calls import ensure_call_from_twilio
 from backend.services.leads import (
     derive_language_from_lead,
@@ -30,6 +30,9 @@ CATEGORY_BY_DIGIT = {
     "4": "earrings",
     "5": "curated combination",
     "6": "accessories",
+    "7": "man jewellery",
+    "8": "ring",
+    "9": "vintage diamond",
 }
 
 CATEGORY_KEYWORDS = {
@@ -39,6 +42,9 @@ CATEGORY_KEYWORDS = {
     "earrings": ["earring", "earrings", "jhumka", "chandbali"],
     "curated combination": ["curated", "combination", "set", "combo"],
     "accessories": ["accessory", "accessories", "maang tikka", "kamarband"],
+    "man jewellery": ["man jewellery", "men jewellery", "men's jewellery", "mens jewellery", "man jewelry", "mens jewelry"],
+    "ring": ["ring", "rings"],
+    "vintage diamond": ["vintage", "vintage diamond", "antique diamond", "old diamond"],
 }
 
 CATEGORY_LABELS = {
@@ -48,6 +54,9 @@ CATEGORY_LABELS = {
     "earrings": "earrings",
     "curated combination": "curated combinations",
     "accessories": "accessories",
+    "man jewellery": "man jewellery",
+    "ring": "rings",
+    "vintage diamond": "vintage diamonds",
 }
 
 SPOKEN_NUMBER_ALIASES = {
@@ -57,6 +66,9 @@ SPOKEN_NUMBER_ALIASES = {
     "4": ["4", "four", "for", "phor", "char", "chaar"],
     "5": ["5", "five", "faiv", "paanch", "panch"],
     "6": ["6", "six", "sicks", "che", "chhe", "cheh"],
+    "7": ["7", "seven", "saavn", "saven"],
+    "8": ["8", "eight", "ait", "ate"],
+    "9": ["9", "nine", "nain"],
 }
 
 VOICE_BY_LANGUAGE = {
@@ -177,7 +189,7 @@ def _build_category_prompt(language_code: str, voice_name: str) -> VoiceResponse
         speech_model="phone_call",
         language=SPEECH_RECOGNITION_LANGUAGE,
         timeout=6,
-        hints="necklace bangle bracelet earring curated combination accessorie man jewellery ring Vintage diamond",
+        hints="necklace bangle bracelet earring curated combination accessories man jewellery ring vintage diamond",
     )
     gather.say(config_service.get_ivr_prompt("menu"), voice=voice_name, language=language_code)
     response.append(gather)
@@ -198,9 +210,15 @@ def _append_dial_instruction(
     log_event(call_sid, "ROUTING_CANDIDATES", {"category": category, "currency": currency, "candidates": candidates})
 
     if not candidates:
-        # Fallback to single pick
-        agent, target_number = pick_agent(category, currency)
-        response.dial(target_number)
+        # No agents configured in DB — do not fall back to environment-configured pools.
+        log_event(call_sid, "NO_AGENT_CONFIGURED", {"category": category, "currency": currency})
+        response.say(
+            _copy({
+                "en-IN": "No agents are configured. Please configure agent phone numbers in the database and try again later.",
+            }, language_code or "en-IN"),
+            voice=VOICE_BY_LANGUAGE.get(language_code or "en-IN"),
+            language=language_code or "en-IN",
+        )
         return
 
     # If operator configured verified-only outbound numbers (useful for Twilio trial accounts),
@@ -268,21 +286,27 @@ def _append_dial_instruction(
             return "+1"
         return num[:3]
 
-    # prefer a verified callerId that matches the first candidate's country
-    if available_verified:
-        cand_pref = _country_prefix(candidates[0])
-        match = next((v for v in available_verified if _country_prefix(v) == cand_pref), None)
-        candidate_choice = match or available_verified[0]
-        # If the chosen candidate_choice accidentally equals a destination
-        # (shouldn't after filtering above), guard and fall back to None.
-        if candidate_choice in candidates:
-            caller_id = None
-            log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": None, "reason": "chosen_verified_matches_candidate; falling_back"})
-        else:
-            caller_id = candidate_choice
-            log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": caller_id, "reason": "matched_by_country_or_first_available"})
+    # Prefer an explicit TWILIO_CALLER_ID (if configured and verified and not equal to a candidate)
+    preferred = getattr(settings, "TWILIO_CALLER_ID", None)
+    if preferred and available_verified and preferred in available_verified and preferred not in candidates:
+        caller_id = preferred
+        log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": caller_id, "reason": "preferred_twilio_caller_id"})
     else:
-        log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": None, "reason": "no_available_verified_numbers_after_filtering"})
+        # prefer a verified callerId that matches the first candidate's country
+        if available_verified:
+            cand_pref = _country_prefix(candidates[0])
+            match = next((v for v in available_verified if _country_prefix(v) == cand_pref), None)
+            candidate_choice = match or available_verified[0]
+            # If the chosen candidate_choice accidentally equals a destination
+            # (shouldn't after filtering above), guard and fall back to None.
+            if candidate_choice in candidates:
+                caller_id = None
+                log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": None, "reason": "chosen_verified_matches_candidate; falling_back"})
+            else:
+                caller_id = candidate_choice
+                log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": caller_id, "reason": "matched_by_country_or_first_available"})
+        else:
+            log_event(call_sid, "CALLER_ID_CHOSEN", {"caller_id": None, "reason": "no_available_verified_numbers_after_filtering"})
 
     dial = Dial(timeout=20, callerId=caller_id) if caller_id else Dial(timeout=20)
     for num in candidates:
