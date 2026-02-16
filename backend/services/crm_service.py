@@ -146,8 +146,8 @@ def create_lead_in_crm(
             "Product_Interest_SFCC__c": product_id if product_id else None,
         }
 
-        # Set hot lead flags for "Try Near You"
-        if intent == "store":
+        # Set hot lead flags for all known intents (store/general_inquiry/price_request/unknown)
+        if intent in title_map:
             lead_body["Rating"] = "Hot"
             lead_body["Lead_Temperature__c"] = "Hot"
 
