@@ -1,7 +1,7 @@
 """Default data for initializing the database."""
 
 DEFAULT_CORRECTIONS = {
-    # Map common STT mishearings to the six canonical categories used by the IVR
+    # Map common STT mishearings to canonical categories used by the IVR
     # Necklaces
     "neck lace": "necklace",
     "neckless": "necklace",
@@ -47,6 +47,22 @@ DEFAULT_CORRECTIONS = {
     "kamarband": "accessories",
     "waistband": "accessories",
 
+    # Rings
+    "ring": "rings",
+    "rings": "rings",
+
+    # Men's jewellery
+    "mens jewellery": "men jewellery",
+    "men's jewellery": "men jewellery",
+    "mens jewelry": "men jewellery",
+    "men's jewelry": "men jewellery",
+
+    # Vintage diamonds
+    "diamond": "vintage diamonds",
+    "diamonds": "vintage diamonds",
+    "vintage diamond": "vintage diamonds",
+    "vintage diamonds": "vintage diamonds",
+
 }
 
 
@@ -70,15 +86,18 @@ DEFAULT_IVR_PROMPTS = {
     
     # After General Inquiry or Try Near You - product or category
     "assist_type_prompt": "Would you like assistance with a specific product or a product category?",
+
+    # Follow-up after user chooses product (or price request) to capture category
+    "product_category_followup_prompt": "Before we proceed, please tell me which category this product belongs to: necklace, bangles, bracelets, earrings, rings, accessories, curated combination, men jewellery, or vintage diamonds.",
     
-    # Product ID collection
-    "product_id_prompt": "Please provide the Product ID for the item you're referring to.",
+    # Product Name collection
+    "product_id_prompt": "Please provide the product name for the item you're referring to (for example: 'Polki Necklace 123').",
     
     # Category name collection  
     "category_prompt": "Kindly mention the category name you're looking for.",
     
-    # Price request - ask for product ID
-    "price_product_prompt": "Please provide the Product ID so I can check the pricing details for you.",
+    # Price request - ask for product name
+    "price_product_prompt": "Please provide the product name so I can check the pricing details for you.",
     
     # Confirmation before connecting to agent
     "confirmation": "Thank you. While I connect you to our agent for further assistance, please briefly describe your query.",

@@ -3,7 +3,7 @@
 New simplified flow:
 1. Greeting → Menu (General Inquiry / Try Near You / Price Request)
 2. General Inquiry or Try Near You → Product vs Category → Collect info → Connect
-3. Price Request → Collect Product ID → Connect
+3. Price Request → Collect Product Name → Connect
 """
 from __future__ import annotations
 
@@ -48,6 +48,23 @@ VOICE_NAME = "Polly.Aditi"
 LANGUAGE_CODE = "en-IN"
 SPEECH_RECOGNITION_LANGUAGE = "en-IN"
 
+# The IVR only accepts these category values (speech synonyms are mapped to these).
+ALLOWED_IVR_CATEGORIES = (
+    "necklace",
+    "bangles",
+    "bracelets",
+    "earrings",
+    "rings",
+    "accessories",
+    "curated combination",
+    "men jewellery",
+    "vintage diamonds",
+)
+
+_CATEGORY_HINTS = (
+    "necklace, necklaces, bangles, bracelets, earrings, rings, accessories, curated combination, men jewellery, vintage diamonds"
+)
+
 # Twilio REST client for status lookups
 twilio_client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
 
@@ -69,6 +86,52 @@ def _normalize_transcript(text: str | None) -> str:
     lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered).strip()
     return lowered
+
+
+def _resolve_category(speech: str | None) -> str | None:
+    """Resolve a spoken category into one of the allowed canonical categories."""
+    transcript = _normalize_transcript(speech)
+    if not transcript:
+        return None
+
+    # Apply configurable misheard corrections (e.g., jhumka -> earrings)
+    transcript = _normalize_transcript(config_service.correct_misheard_words(transcript))
+
+    # Direct contains-match mapping (longer phrases first)
+    variants_to_canonical: dict[str, str] = {
+        "curated combination": "curated combination",
+        "curated combinations": "curated combination",
+        "curated combo": "curated combination",
+        "men jewellery": "men jewellery",
+        "mens jewellery": "men jewellery",
+        "men jewelry": "men jewellery",
+        "mens jewelry": "men jewellery",
+        "gents jewellery": "men jewellery",
+        "gents jewelry": "men jewellery",
+        "necklace": "necklace",
+        "necklaces": "necklace",
+        "bangle": "bangles",
+        "bangles": "bangles",
+        "bracelet": "bracelets",
+        "bracelets": "bracelets",
+        "earring": "earrings",
+        "earrings": "earrings",
+        "ring": "rings",
+        "rings": "rings",
+        "accessory": "accessories",
+        "accessories": "accessories",
+        "vintage diamonds": "vintage diamonds",
+        "vintage diamond": "vintage diamonds",
+        "diamond": "vintage diamonds",
+        "diamonds": "vintage diamonds",
+    }
+
+    for variant in sorted(variants_to_canonical.keys(), key=len, reverse=True):
+        if variant in transcript:
+            canonical = variants_to_canonical[variant]
+            return canonical if canonical in ALLOWED_IVR_CATEGORIES else None
+
+    return None
 
 
 # ==================== ENTRY POINT ====================
@@ -140,10 +203,37 @@ async def voice_intent(request: Request) -> Response:
     intent = _resolve_intent(speech_result)
     
     if not intent:
-        # Could not determine intent - use default agent
+        # Could not determine intent - play "invalid" and reprompt menu.
         log_event(call_sid, "INTENT_NOT_RECOGNIZED", {"speech": speech_result})
         record_intent(call_sid, "unknown")
-        return _connect_to_default_agent(call_sid, from_number)
+
+        response = VoiceResponse()
+
+        invalid_text = _get_prompt("invalid")
+        log_event(call_sid, "IVR_SAY", {"prompt": "invalid", "message": invalid_text})
+        response.say(invalid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+
+        gather = Gather(
+            input="speech",
+            action="/voice/intent",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=8,
+            hints="general inquiry, try near you, price request, general, inquiry, store, price, pricing",
+        )
+        menu_text = _get_prompt("menu")
+        log_event(call_sid, "IVR_SAY", {"prompt": "menu", "message": menu_text})
+        gather.say(menu_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+
+        # If still no input, loop back to /voice
+        reprompt_text = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice")
+        return Response(content=str(response), media_type="application/xml")
 
     # Persist choice
     record_intent(call_sid, intent)
@@ -208,6 +298,12 @@ async def _continue_after_name(call_sid: str, from_number: str | None) -> Respon
     lead = get_lead_by_call_sid(call_sid)
     intent = lead.extra_metadata.get("intent") if lead and lead.extra_metadata else None
 
+    log_event(call_sid, "INTENT_LOOKUP_AFTER_NAME", {
+        "intent": intent,
+        "has_lead": bool(lead),
+        "has_extra_metadata": bool(getattr(lead, "extra_metadata", None)),
+    })
+
     response = VoiceResponse()
     
     if intent in ("general_inquiry", "store"):
@@ -227,30 +323,36 @@ async def _continue_after_name(call_sid: str, from_number: str | None) -> Respon
         gather.say(assist_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
         
-        # If no input, connect to default agent
-        response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
-        _append_dial_instruction(response, call_sid, None, None, from_number)
+        # If no input, reprompt and re-run this step (do not connect)
+        reprompt_text = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/name-fallback")
         return Response(content=str(response), media_type="application/xml")
 
-    # price_request - ask for product ID
+    # price_request - ask for product name
     if intent == "price_request":
+        # For price requests, also first capture the product's category
         gather = Gather(
             input="speech",
-            action="/voice/price-product",
+            action="/voice/product-category",
             speech_timeout="auto",
             barge_in=True,
             speech_model="phone_call",
             language=SPEECH_RECOGNITION_LANGUAGE,
-            timeout=10,
+            timeout=8,
+            hints=_CATEGORY_HINTS,
         )
-        price_text = _get_prompt("price_product_prompt")
-        log_event(call_sid, "IVR_SAY", {"prompt": "price_product_prompt", "message": price_text})
-        gather.say(price_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        followup_text = _get_prompt("product_category_followup_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "product_category_followup_prompt", "message": followup_text})
+        gather.say(followup_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
-        
-        # If no input, connect to default agent
-        response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
-        _append_dial_instruction(response, call_sid, None, None, from_number)
+
+        # If no input, reprompt and re-run this step (do not connect)
+        reprompt_text = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/name-fallback")
         return Response(content=str(response), media_type="application/xml")
 
     # Unknown intent - connect to default agent
@@ -296,9 +398,34 @@ async def voice_assist_type(request: Request) -> Response:
     choice = _resolve_assist_type(speech_result)
     
     if not choice:
-        # Could not determine - connect to default agent
+        # Could not determine - play invalid and re-ask
         log_event(call_sid, "ASSIST_TYPE_NOT_RECOGNIZED", {"speech": speech_result})
-        return _connect_to_default_agent(call_sid, from_number)
+
+        response = VoiceResponse()
+        invalid_text = _get_prompt("invalid")
+        log_event(call_sid, "IVR_SAY", {"prompt": "invalid", "message": invalid_text})
+        response.say(invalid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+
+        gather = Gather(
+            input="speech",
+            action="/voice/assist-type",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=8,
+            hints="product, category, specific product, product category, item, type",
+        )
+        assist_text = _get_prompt("assist_type_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "assist_type_prompt", "message": assist_text})
+        gather.say(assist_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+
+        reprompt_text = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/name-fallback")
+        return Response(content=str(response), media_type="application/xml")
 
     record_assist_type(call_sid, choice)
     log_event(call_sid, "ASSIST_TYPE_SELECTED", {"assist_type": choice})
@@ -306,24 +433,27 @@ async def voice_assist_type(request: Request) -> Response:
     response = VoiceResponse()
     
     if choice == "product":
-        # Ask for product ID
+        # Ask a follow-up question to capture product category before product name
         gather = Gather(
             input="speech",
-            action="/voice/product-id",
+            action="/voice/product-category",
             speech_timeout="auto",
             barge_in=True,
             speech_model="phone_call",
             language=SPEECH_RECOGNITION_LANGUAGE,
-            timeout=10,
+            timeout=8,
+            hints=_CATEGORY_HINTS,
         )
-        pid_text = _get_prompt("product_id_prompt")
-        log_event(call_sid, "IVR_SAY", {"prompt": "product_id_prompt", "message": pid_text})
-        gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        followup_text = _get_prompt("product_category_followup_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "product_category_followup_prompt", "message": followup_text})
+        gather.say(followup_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
-        
-        # If no input, connect to default agent
-        response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
-        _append_dial_instruction(response, call_sid, None, None, from_number)
+
+        # If no input, reprompt and retry
+        reprompt_text = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/name-fallback")
         return Response(content=str(response), media_type="application/xml")
 
     # category - ask for category name
@@ -335,16 +465,18 @@ async def voice_assist_type(request: Request) -> Response:
         speech_model="phone_call",
         language=SPEECH_RECOGNITION_LANGUAGE,
         timeout=8,
-        hints="necklace, bangles, bracelets, earrings, rings, accessories",
+        hints=_CATEGORY_HINTS,
     )
     cat_text = _get_prompt("category_prompt")
     log_event(call_sid, "IVR_SAY", {"prompt": "category_prompt", "message": cat_text})
     gather.say(cat_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
     response.append(gather)
     
-    # If no input, connect to default agent
-    response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
-    _append_dial_instruction(response, call_sid, None, None, from_number)
+    # If no input, reprompt and retry
+    reprompt_text = _get_prompt("reprompt")
+    log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+    response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    response.redirect("/voice/name-fallback")
     return Response(content=str(response), media_type="application/xml")
 
 
@@ -367,42 +499,158 @@ def _resolve_assist_type(speech: str | None) -> str | None:
     return None
 
 
-# ==================== PRODUCT ID COLLECTION ====================
+# ==================== PRODUCT NAME COLLECTION ====================
 
 @router.post("/voice/product-id")
 async def voice_product_id(request: Request) -> Response:
-    """Collect product ID and connect to agent."""
+    """Collect product name and connect to agent."""
     form = await request.form()
     call_sid = form.get("CallSid")
     speech_result = form.get("SpeechResult")
     from_number = form.get("From")
 
-    product_id = (speech_result or "").strip()
-    
-    if product_id:
-        record_product_id(call_sid, product_id)
-        log_event(call_sid, "PRODUCT_ID_CAPTURED", {"product_id": product_id})
-    else:
-        log_event(call_sid, "PRODUCT_ID_NOT_PROVIDED", {})
+    product_name = (speech_result or "").strip()
 
-    # Ask for brief description then connect
+    if product_name:
+        # store product name (we reuse the product_id column)
+        record_product_id(call_sid, product_name)
+        log_event(call_sid, "PRODUCT_NAME_CAPTURED", {"product_name": product_name})
+    else:
+        log_event(call_sid, "PRODUCT_NAME_NOT_PROVIDED", {})
+
+        # Re-ask product name (do not connect).
+        # Note: For Twilio <Gather>, when there's no speech, Twilio typically does NOT
+        # call the action URL and instead continues to the next verb. In our flows,
+        # the "reprompt" is spoken after <Gather> before redirecting back here.
+        # To avoid callers hearing "reprompt" twice, we don't speak it again here.
+        response = VoiceResponse()
+        gather = Gather(
+            input="speech",
+            action="/voice/product-id",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=10,
+        )
+        pid_text = _get_prompt("product_id_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "product_id_prompt", "message": pid_text})
+        gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+
+        reprompt_text_2 = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text_2})
+        response.say(reprompt_text_2, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/product-id")
+        return Response(content=str(response), media_type="application/xml")
+
+    # Directly route to agent and sync CRM using collected data
+    lead = get_lead_by_call_sid(call_sid)
+    category = getattr(lead, "selected_category", None)
+    currency = getattr(lead, "currency", None)
+
+    _sync_crm_lead_for_call(call_sid, from_number, None)
+
+    response = VoiceResponse()
+    _append_dial_instruction(response, call_sid, category, currency, from_number)
+    return Response(content=str(response), media_type="application/xml")
+
+
+@router.post("/voice/product-category")
+async def voice_product_category(request: Request) -> Response:
+    """Capture the category for a product (general or price) and then ask for product name.
+
+    This is invoked after the caller has already indicated they want product-level help
+    (either via General Inquiry / Try Near You, or via Price Request).
+    """
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    speech_result = form.get("SpeechResult")
+    from_number = form.get("From")
+
+    raw_category = (speech_result or "").strip()
+    resolved_category = _resolve_category(raw_category)
+
+    if resolved_category:
+        record_category_selection(call_sid, resolved_category)
+        log_event(call_sid, "PRODUCT_CATEGORY_CAPTURED", {"category": resolved_category, "raw": raw_category})
+    elif raw_category:
+        # Spoken input present, but not in allowed list
+        log_event(call_sid, "PRODUCT_CATEGORY_NOT_RECOGNIZED", {"speech": raw_category, "allowed": list(ALLOWED_IVR_CATEGORIES)})
+
+        response = VoiceResponse()
+        invalid_text = _get_prompt("invalid")
+        log_event(call_sid, "IVR_SAY", {"prompt": "invalid", "message": invalid_text})
+        response.say(invalid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+
+        gather = Gather(
+            input="speech",
+            action="/voice/product-category",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=8,
+            hints=_CATEGORY_HINTS,
+        )
+        followup_text = _get_prompt("product_category_followup_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "product_category_followup_prompt", "message": followup_text})
+        gather.say(followup_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+
+        reprompt_text = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/product-category")
+        return Response(content=str(response), media_type="application/xml")
+    else:
+        log_event(call_sid, "PRODUCT_CATEGORY_NOT_PROVIDED", {})
+
+        # Re-ask category follow-up (do not proceed). Avoid speaking "reprompt" here
+        # to prevent duplicate "reprompt" when reached via <Redirect> after a no-input.
+        response = VoiceResponse()
+        gather = Gather(
+            input="speech",
+            action="/voice/product-category",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=8,
+            hints=_CATEGORY_HINTS,
+        )
+        followup_text = _get_prompt("product_category_followup_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "product_category_followup_prompt", "message": followup_text})
+        gather.say(followup_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+
+        reprompt_text_2 = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text_2})
+        response.say(reprompt_text_2, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/product-category")
+        return Response(content=str(response), media_type="application/xml")
+
+    # Next ask for product name (same prompt key used today)
     response = VoiceResponse()
     gather = Gather(
         input="speech",
-        action="/voice/description",
+        action="/voice/product-id",
         speech_timeout="auto",
-        barge_in=False,
+        barge_in=True,
         speech_model="phone_call",
         language=SPEECH_RECOGNITION_LANGUAGE,
         timeout=10,
     )
-    conf_text = _get_prompt("confirmation")
-    log_event(call_sid, "IVR_SAY", {"prompt": "confirmation", "message": conf_text})
-    gather.say(conf_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    pid_text = _get_prompt("product_id_prompt")
+    log_event(call_sid, "IVR_SAY", {"prompt": "product_id_prompt", "message": pid_text})
+    gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
     response.append(gather)
-    
-    # If no description, proceed to dial
-    _append_dial_instruction(response, call_sid, None, None, from_number)
+
+    # If no input, reprompt and retry product name
+    reprompt_text = _get_prompt("reprompt")
+    log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+    response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    response.redirect("/voice/product-id")
     return Response(content=str(response), media_type="application/xml")
 
 
@@ -410,36 +658,51 @@ async def voice_product_id(request: Request) -> Response:
 
 @router.post("/voice/price-product")
 async def voice_price_product(request: Request) -> Response:
-    """Collect product ID for pricing and connect to agent."""
+    """Collect product name for pricing and connect to agent."""
     form = await request.form()
     call_sid = form.get("CallSid")
     speech_result = form.get("SpeechResult")
     from_number = form.get("From")
 
-    product_id = (speech_result or "").strip()
+    product_name = (speech_result or "").strip()
     
-    if product_id:
-        record_product_id(call_sid, product_id)
-        log_event(call_sid, "PRICE_PRODUCT_ID_CAPTURED", {"product_id": product_id})
+    if product_name:
+        record_product_id(call_sid, product_name)
+        log_event(call_sid, "PRICE_PRODUCT_NAME_CAPTURED", {"product_name": product_name})
     else:
-        log_event(call_sid, "PRICE_PRODUCT_ID_NOT_PROVIDED", {})
+        log_event(call_sid, "PRICE_PRODUCT_NAME_NOT_PROVIDED", {})
 
-    # Ask for brief description then connect
+        # Retry instead of dialing an agent on no/empty input
+        response = VoiceResponse()
+        gather = Gather(
+            input="speech",
+            action="/voice/price-product",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=10,
+        )
+        pid_text = _get_prompt("product_id_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "product_id_prompt", "message": pid_text})
+        gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+
+        reprompt_text = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/price-product")
+        return Response(content=str(response), media_type="application/xml")
+
+    # Directly route to agent and sync CRM using collected data
+    lead = get_lead_by_call_sid(call_sid)
+    category = getattr(lead, "selected_category", None)
+    currency = getattr(lead, "currency", None)
+
+    _sync_crm_lead_for_call(call_sid, from_number, None)
+
     response = VoiceResponse()
-    gather = Gather(
-        input="speech",
-        action="/voice/description",
-        speech_timeout="auto",
-        barge_in=False,
-        speech_model="phone_call",
-        language=SPEECH_RECOGNITION_LANGUAGE,
-        timeout=10,
-    )
-    gather.say(_get_prompt("confirmation"), voice=VOICE_NAME, language=LANGUAGE_CODE)
-    response.append(gather)
-    
-    # If no description, proceed to dial
-    _append_dial_instruction(response, call_sid, None, None, from_number)
+    _append_dial_instruction(response, call_sid, category, currency, from_number)
     return Response(content=str(response), media_type="application/xml")
 
 
@@ -453,17 +716,70 @@ async def voice_category_name(request: Request) -> Response:
     speech_result = form.get("SpeechResult")
     from_number = form.get("From")
 
-    category = (speech_result or "").strip()
-    
-    if category:
-        record_category_selection(call_sid, category)
-        log_event(call_sid, "CATEGORY_NAME_CAPTURED", {"category": category})
+    raw_category = (speech_result or "").strip()
+    resolved_category = _resolve_category(raw_category)
+
+    if resolved_category:
+        record_category_selection(call_sid, resolved_category)
+        log_event(call_sid, "CATEGORY_NAME_CAPTURED", {"category": resolved_category, "raw": raw_category})
+    elif raw_category:
+        log_event(call_sid, "CATEGORY_NAME_NOT_RECOGNIZED", {"speech": raw_category, "allowed": list(ALLOWED_IVR_CATEGORIES)})
+
+        response = VoiceResponse()
+        invalid_text = _get_prompt("invalid")
+        log_event(call_sid, "IVR_SAY", {"prompt": "invalid", "message": invalid_text})
+        response.say(invalid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+
+        gather = Gather(
+            input="speech",
+            action="/voice/category-name",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=8,
+            hints=_CATEGORY_HINTS,
+        )
+        cat_text = _get_prompt("category_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "category_prompt", "message": cat_text})
+        gather.say(cat_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+
+        reprompt_text = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
+        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/category-name")
+        return Response(content=str(response), media_type="application/xml")
     else:
         log_event(call_sid, "CATEGORY_NAME_NOT_PROVIDED", {})
 
+        # Re-ask category question (do not connect). Avoid speaking "reprompt" here
+        # to prevent duplicate "reprompt" when reached via <Redirect> after a no-input.
+        response = VoiceResponse()
+        gather = Gather(
+            input="speech",
+            action="/voice/category-name",
+            speech_timeout="auto",
+            barge_in=True,
+            speech_model="phone_call",
+            language=SPEECH_RECOGNITION_LANGUAGE,
+            timeout=8,
+            hints=_CATEGORY_HINTS,
+        )
+        cat_text = _get_prompt("category_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "category_prompt", "message": cat_text})
+        gather.say(cat_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.append(gather)
+
+        reprompt_text_2 = _get_prompt("reprompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text_2})
+        response.say(reprompt_text_2, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.redirect("/voice/category-name")
+        return Response(content=str(response), media_type="application/xml")
+
     # Directly route to agent and sync CRM using collected data
     lead = get_lead_by_call_sid(call_sid)
-    selected_category = category if category else getattr(lead, "selected_category", None)
+    selected_category = resolved_category if resolved_category else getattr(lead, "selected_category", None)
 
     # Ensure CRM lead is sent even if /voice/description is never hit
     _sync_crm_lead_for_call(call_sid, from_number, None)

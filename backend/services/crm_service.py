@@ -136,14 +136,31 @@ def create_lead_in_crm(
         last_name = caller_name or "Web Lead"
         company = "Individual"
 
+        # NOTE:
+        # - We intentionally do NOT send the product value to Salesforce's
+        #   Product_Interest_SFCC__c field anymore.
+        # - The caller-provided product (now a product *name*) is appended
+        #   to Notes__c together with other captured context.
+
+        # Build notes payload
+        notes_pieces = []
+        if category:
+            notes_pieces.append(f"Category: {category}")
+        if product_id:
+            notes_pieces.append(f"Product: {product_id}")
+        if description:
+            notes_pieces.append(str(description))
+        notes_text = "\n\n".join([p for p in notes_pieces if p]) or None
+
         lead_body = {
             "LastName": last_name,
             "Company": company,
             "Email": None,  # Not collected in IVR
             "MobilePhone": mobile_phone,
-            "Notes__c": description,
+            "Notes__c": notes_text,
             "Title": title,
-            "Product_Interest_SFCC__c": product_id if product_id else None,
+            # Always send null/omit this SFCC product field; product name goes into Notes__c.
+            "Product_Interest_SFCC__c": None,
         }
 
         # Set hot lead flags for all known intents (store/general_inquiry/price_request/unknown)
@@ -151,14 +168,7 @@ def create_lead_in_crm(
             lead_body["Rating"] = "Hot"
             lead_body["Lead_Temperature__c"] = "Hot"
 
-        # Add category to notes if provided and no product ID
-        if category and not product_id:
-            notes = lead_body.get("Notes__c") or ""
-            if notes:
-                notes = f"Category: {category}\n\n{notes}"
-            else:
-                notes = f"Category: {category}"
-            lead_body["Notes__c"] = notes
+        # Notes__c is already built above with Category/Product/Description
 
         # Remove None values (Salesforce doesn't like explicit nulls for some fields)
         lead_body = {k: v for k, v in lead_body.items() if v is not None}

@@ -22,10 +22,20 @@ CATEGORY_NORMALIZER = {
     "bracelets": "bracelets",
     "earring": "earrings",
     "earrings": "earrings",
+    "ring": "rings",
+    "rings": "rings",
     "curated combination": "curated combination",
     "curated combinations": "curated combination",
     "accessory": "accessories",
     "accessories": "accessories",
+    "men jewellery": "men jewellery",
+    "mens jewellery": "men jewellery",
+    "men jewelry": "men jewellery",
+    "mens jewelry": "men jewellery",
+    "vintage diamonds": "vintage diamonds",
+    "vintage diamond": "vintage diamonds",
+    "diamond": "vintage diamonds",
+    "diamonds": "vintage diamonds",
 }
 
 

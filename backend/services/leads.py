@@ -44,7 +44,19 @@ def upsert_call_lead(payload: Dict[str, Any]) -> CallLead:
         lead.user_type = payload.get("user_type", lead.user_type)
         lead.customer_id = payload.get("customer_id", lead.customer_id)
         lead.product_id = payload.get("product_id", lead.product_id)
-        lead.extra_metadata = payload.get("metadata", lead.extra_metadata)
+        # Important: website context updates should not wipe IVR-captured metadata
+        # (intent, caller_name, etc). Merge dictionaries and protect reserved keys.
+        if "metadata" in payload and payload.get("metadata") is not None:
+            incoming_meta = payload.get("metadata") or {}
+            existing_meta = lead.extra_metadata or {}
+
+            reserved_keys = {"intent", "caller_name", "assist_type", "caller_description"}
+            merged = dict(existing_meta)
+            for key, value in incoming_meta.items():
+                if key in reserved_keys and merged.get(key) is not None:
+                    continue
+                merged[key] = value
+            lead.extra_metadata = merged
 
         incoming_category = payload.get("product_category")
         if incoming_category:
@@ -98,7 +110,7 @@ def record_intent(call_sid: str, intent: str) -> Optional[CallLead]:
         if not lead:
             lead = CallLead(call_sid=call_sid)
 
-        extra = lead.extra_metadata or {}
+        extra = dict(lead.extra_metadata or {})
         extra["intent"] = intent
         lead.extra_metadata = extra
 
@@ -121,7 +133,7 @@ def record_assist_type(call_sid: str, assist_type: str) -> Optional[CallLead]:
         if not lead:
             lead = CallLead(call_sid=call_sid)
 
-        extra = lead.extra_metadata or {}
+        extra = dict(lead.extra_metadata or {})
         extra["assist_type"] = assist_type
         lead.extra_metadata = extra
 
@@ -134,13 +146,18 @@ def record_assist_type(call_sid: str, assist_type: str) -> Optional[CallLead]:
 
 
 def record_product_id(call_sid: str, product_id: str) -> Optional[CallLead]:
-    """Store the provided Product ID on the call lead."""
+    """Store the provided Product name on the call lead.
+
+    NOTE: the DB column is `product_id` but we reuse it to store the
+    human-friendly product name provided by the caller.
+    """
     db = SessionLocal()
     try:
         lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
         if not lead:
             lead = CallLead(call_sid=call_sid)
 
+        # Store the product name in the existing product_id column
         lead.product_id = product_id
         db.add(lead)
         db.commit()
@@ -158,7 +175,7 @@ def record_description(call_sid: str, description: str) -> Optional[CallLead]:
         if not lead:
             lead = CallLead(call_sid=call_sid)
 
-        extra = lead.extra_metadata or {}
+        extra = dict(lead.extra_metadata or {})
         extra["caller_description"] = description
         lead.extra_metadata = extra
 
@@ -178,7 +195,7 @@ def record_caller_name(call_sid: str, caller_name: str) -> Optional[CallLead]:
         if not lead:
             lead = CallLead(call_sid=call_sid)
 
-        extra = lead.extra_metadata or {}
+        extra = dict(lead.extra_metadata or {})
         extra["caller_name"] = caller_name
         lead.extra_metadata = extra
 
@@ -226,12 +243,12 @@ def record_full_interaction(call_sid: str, *, intent: str | None = None, assist_
             lead = CallLead(call_sid=call_sid)
 
         if intent is not None:
-            extra = lead.extra_metadata or {}
+            extra = dict(lead.extra_metadata or {})
             extra["intent"] = intent
             lead.extra_metadata = extra
 
         if assist_type is not None:
-            extra = lead.extra_metadata or {}
+            extra = dict(lead.extra_metadata or {})
             extra["assist_type"] = assist_type
             lead.extra_metadata = extra
 
@@ -242,7 +259,7 @@ def record_full_interaction(call_sid: str, *, intent: str | None = None, assist_
             lead.selected_category = product_category.lower()
 
         if description is not None:
-            extra = lead.extra_metadata or {}
+            extra = dict(lead.extra_metadata or {})
             extra["caller_description"] = description
             lead.extra_metadata = extra
 

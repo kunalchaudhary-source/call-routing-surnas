@@ -9,10 +9,10 @@ const PROMPT_KEYS = [
   "invalid",
   "name_prompt",
   "assist_type_prompt",
+  "product_category_followup_prompt",
   "product_id_prompt",
   "category_prompt",
   "price_product_prompt",
-  "confirmation",
   "connecting",
   "no_agent",
 ] as const;
@@ -23,10 +23,10 @@ const PROMPT_LABELS: Record<(typeof PROMPT_KEYS)[number], string> = {
   invalid: "Invalid Selection Message",
   name_prompt: "Caller Name Request",
   assist_type_prompt: "Product vs Category Question",
-  product_id_prompt: "Product ID Request",
+  product_category_followup_prompt: "Product / Price: Category Follow-up Question",
+  product_id_prompt: "Product Name Request",
   category_prompt: "Category Name Request",
-  price_product_prompt: "Price Request - Product ID",
-  confirmation: "Confirmation + Description Request",
+  price_product_prompt: "Price Request - Product Name",
   connecting: "Connecting to Agent",
   no_agent: "No Agent Available",
 };
@@ -37,10 +37,10 @@ const PROMPT_DESCRIPTIONS: Record<(typeof PROMPT_KEYS)[number], string> = {
   invalid: "Played when user's response is not understood",
   name_prompt: "Asks caller for their name to provide personalized assistance",
   assist_type_prompt: "Asks if user wants help with a specific product or category",
-  product_id_prompt: "Asks user to provide the Product ID",
+  product_category_followup_prompt: "After user chooses product or price request, asks which category the product belongs to",
+  product_id_prompt: "Asks user to provide the Product Name",
   category_prompt: "Asks user to mention the category name",
-  price_product_prompt: "Asks user for Product ID (for pricing queries)",
-  confirmation: "Thanks user and asks for brief query description before connecting",
+  price_product_prompt: "Asks user for Product Name (for pricing queries)",
   connecting: "Announcement before connecting to agent",
   no_agent: "Message when no agent is available",
 };
@@ -108,7 +108,7 @@ export function IVRPromptPanel() {
             <textarea
               value={drafts[key] ?? ""}
               onChange={(e) => setDrafts((prev) => ({ ...prev, [key]: e.target.value }))}
-              rows={key === "menu" || key === "confirmation" ? 4 : 2}
+              rows={key === "menu" ? 4 : 2}
               className="w-full glass-panel rounded-3xl p-4 font-sans text-sm text-onyx/80 focus:outline-none focus:ring-2 focus:ring-garnet"
             />
           </div>

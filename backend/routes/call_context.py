@@ -12,8 +12,11 @@ ALLOWED_CATEGORIES = {
     "bangles",
     "bracelets",
     "earrings",
+    "rings",
     "curated combination",
     "accessories",
+    "men jewellery",
+    "vintage diamonds",
 }
 
 
@@ -44,5 +47,5 @@ class CallContextResponse(BaseModel):
 
 @router.post("", response_model=CallContextResponse)
 async def register_call_context(payload: CallContextPayload) -> CallContextResponse:
-    lead = upsert_call_lead(payload.dict())
+    lead = upsert_call_lead(payload.dict(exclude_none=True))
     return CallContextResponse(lead_id=str(lead.id), preferred_language=lead.preferred_language or "en-IN")
