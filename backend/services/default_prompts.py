@@ -83,6 +83,8 @@ DEFAULT_IVR_PROMPTS = {
     
     # Name collection - asked after intent selection
     "name_prompt": "May I have your name please, so that we can provide you with more specific assistance?",
+    # Name profanity failure
+    "name_profanity_failed_prompt": "I'm sorry, I couldn't accept that name. Could you please tell me your name again?",
     
     # After General Inquiry or Try Near You - product or category
     "assist_type_prompt": "Would you like assistance with a specific product or a product category?",

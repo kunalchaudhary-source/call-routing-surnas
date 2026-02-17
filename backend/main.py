@@ -1,5 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+import base64
+
+from backend.config import get_settings
 
 from backend.routes import router as routes_router
 from backend.routes.admin import router as admin_router
@@ -17,6 +20,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def admin_auth_middleware(request: Request, call_next):
+    """Protect /admin routes with simple Basic auth using env vars, except /admin/login."""
+    path = str(request.url.path)
+    # Allow CORS preflight requests through without auth
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if path.startswith("/admin") and not path.startswith("/admin/login"):
+        auth = request.headers.get("authorization")
+        if not auth or not auth.lower().startswith("basic "):
+            return Response(status_code=401, content="Unauthorized")
+        try:
+            token = auth.split(" ", 1)[1]
+            decoded = base64.b64decode(token).decode("utf-8")
+            if ":" not in decoded:
+                return Response(status_code=401, content="Unauthorized")
+            username, password = decoded.split(":", 1)
+            settings = get_settings()
+            if username != settings.ADMIN_USERNAME or password != settings.ADMIN_PASSWORD:
+                return Response(status_code=401, content="Unauthorized")
+        except Exception:
+            return Response(status_code=401, content="Unauthorized")
+
+    return await call_next(request)
 
 
 @app.on_event("startup")

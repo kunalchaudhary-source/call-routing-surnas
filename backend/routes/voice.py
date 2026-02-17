@@ -273,6 +273,35 @@ async def voice_name(request: Request) -> Response:
     caller_name = (speech_result or "").strip()
     
     if caller_name:
+        # Run profanity/safety check via Gemini (or fallback blacklist)
+        try:
+            profane = gemini_service.is_profane(caller_name)
+        except Exception:
+            profane = False
+
+        if profane:
+            # Log and re-ask name using configurable prompt
+            log_event(call_sid, "CALLER_NAME_PROFANITY_REJECTED", {"name": caller_name})
+            response = VoiceResponse()
+            # Speak the configured prompt
+            bad_name_text = _get_prompt("name_profanity_failed_prompt")
+            log_event(call_sid, "IVR_SAY", {"prompt": "name_profanity_failed_prompt", "message": bad_name_text})
+            gather = Gather(
+                input="speech",
+                action="/voice/name",
+                speech_timeout="auto",
+                barge_in=True,
+                speech_model="phone_call",
+                language=SPEECH_RECOGNITION_LANGUAGE,
+                timeout=8,
+            )
+            gather.say(bad_name_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+            response.append(gather)
+            # If still no valid name, fall back to name-fallback which continues the flow
+            response.redirect("/voice/name-fallback")
+            return Response(content=str(response), media_type="application/xml")
+
+        # Acceptable name
         record_caller_name(call_sid, caller_name)
         log_event(call_sid, "CALLER_NAME_CAPTURED", {"name": caller_name})
     else:
@@ -330,22 +359,20 @@ async def _continue_after_name(call_sid: str, from_number: str | None) -> Respon
         response.redirect("/voice/name-fallback")
         return Response(content=str(response), media_type="application/xml")
 
-    # price_request - ask for product name
+    # price_request - ask for product name directly (no separate category question)
     if intent == "price_request":
-        # For price requests, also first capture the product's category
         gather = Gather(
             input="speech",
-            action="/voice/product-category",
+            action="/voice/price-product",
             speech_timeout="auto",
             barge_in=True,
             speech_model="phone_call",
             language=SPEECH_RECOGNITION_LANGUAGE,
-            timeout=8,
-            hints=_CATEGORY_HINTS,
+            timeout=10,
         )
-        followup_text = _get_prompt("product_category_followup_prompt")
-        log_event(call_sid, "IVR_SAY", {"prompt": "product_category_followup_prompt", "message": followup_text})
-        gather.say(followup_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        pid_text = _get_prompt("price_product_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "price_product_prompt", "message": pid_text})
+        gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
 
         # If no input, reprompt and re-run this step (do not connect)
@@ -433,20 +460,19 @@ async def voice_assist_type(request: Request) -> Response:
     response = VoiceResponse()
     
     if choice == "product":
-        # Ask a follow-up question to capture product category before product name
+        # Directly ask for product name (no category follow-up)
         gather = Gather(
             input="speech",
-            action="/voice/product-category",
+            action="/voice/product-id",
             speech_timeout="auto",
             barge_in=True,
             speech_model="phone_call",
             language=SPEECH_RECOGNITION_LANGUAGE,
-            timeout=8,
-            hints=_CATEGORY_HINTS,
+            timeout=10,
         )
-        followup_text = _get_prompt("product_category_followup_prompt")
-        log_event(call_sid, "IVR_SAY", {"prompt": "product_category_followup_prompt", "message": followup_text})
-        gather.say(followup_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        pid_text = _get_prompt("product_id_prompt")
+        log_event(call_sid, "IVR_SAY", {"prompt": "product_id_prompt", "message": pid_text})
+        gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
 
         # If no input, reprompt and retry
@@ -499,6 +525,50 @@ def _resolve_assist_type(speech: str | None) -> str | None:
     return None
 
 
+def _infer_category_from_product_name(call_sid: str, product_name: str) -> None:
+    """Infer and store category from a spoken product name, if not already set.
+
+    Uses the same category resolver as explicit category questions and only
+    writes selected_category if we can confidently map into ALLOWED_IVR_CATEGORIES.
+    """
+    from backend.services.leads import get_lead_by_call_sid as _get_lead, record_category_selection as _record_cat
+
+    if not product_name:
+        return
+
+    lead = _get_lead(call_sid)
+    existing = getattr(lead, "selected_category", None) if lead else None
+    if existing:
+        return
+
+    # First try the rule-based resolver
+    resolved = _resolve_category(product_name)
+    # If rule-based didn't resolve, try the Gemini classifier
+    if not resolved:
+        try:
+            from backend.services import gemini_service
+            allowed = [
+                "necklace",
+                "bangles",
+                "bracelets",
+                "earrings",
+                "curated combination",
+                "accessories",
+                "men jewellery",
+                "rings",
+                "vintage diamonds",
+            ]
+            gemini_cat = gemini_service.infer_category_from_product(product_name, allowed)
+            if gemini_cat:
+                resolved = gemini_cat
+        except Exception:
+            resolved = None
+
+    if resolved:
+        _record_cat(call_sid, resolved)
+        log_event(call_sid, "CATEGORY_INFERRED_FROM_PRODUCT_NAME", {"category": resolved, "raw_product_name": product_name})
+
+
 # ==================== PRODUCT NAME COLLECTION ====================
 
 @router.post("/voice/product-id")
@@ -514,6 +584,7 @@ async def voice_product_id(request: Request) -> Response:
     if product_name:
         # store product name (we reuse the product_id column)
         record_product_id(call_sid, product_name)
+        _infer_category_from_product_name(call_sid, product_name)
         log_event(call_sid, "PRODUCT_NAME_CAPTURED", {"product_name": product_name})
     else:
         log_event(call_sid, "PRODUCT_NAME_NOT_PROVIDED", {})
@@ -668,6 +739,7 @@ async def voice_price_product(request: Request) -> Response:
     
     if product_name:
         record_product_id(call_sid, product_name)
+        _infer_category_from_product_name(call_sid, product_name)
         log_event(call_sid, "PRICE_PRODUCT_NAME_CAPTURED", {"product_name": product_name})
     else:
         log_event(call_sid, "PRICE_PRODUCT_NAME_NOT_PROVIDED", {})
@@ -1015,7 +1087,22 @@ async def voice_dial_complete(request: Request) -> Response:
             from backend.models.db_models import Agent
             db = SessionLocal()
             try:
-                agent = db.query(Agent).filter(Agent.phone_number == to_number).one_or_none()
+                # Query for agent by phone number. Use defensive logic in case
+                # duplicate rows exist (MultipleResultsFound) — pick the first and log.
+                try:
+                    agent = db.query(Agent).filter(Agent.phone_number == to_number).one_or_none()
+                except Exception as multi_exc:
+                    # Fall back to fetching all matches and choose the first
+                    try:
+                        rows = db.query(Agent).filter(Agent.phone_number == to_number).all()
+                        if rows:
+                            agent = rows[0]
+                            log_event(call_sid, "AGENT_LOOKUP_MULTIPLE", {"phone_number": to_number, "count": len(rows)})
+                        else:
+                            agent = None
+                    except Exception:
+                        agent = None
+
                 if agent:
                     agent_info = {"agent_id": agent.id, "name": agent.name, "region": agent.region, "phone_number": agent.phone_number}
             finally:

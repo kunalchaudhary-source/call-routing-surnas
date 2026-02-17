@@ -38,6 +38,9 @@ class Settings:
 
         # Google Gemini (for AI responses)
         self.GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
+        # Admin credentials for the admin console (optional - defaults provided)
+        self.ADMIN_USERNAME: str = os.getenv("ADMIN_USERNAME", "admin")
+        self.ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin@741")
         # TaskRouter (optional)
         self.TASKROUTER_WORKSPACE_SID: Optional[str] = os.getenv("TASKROUTER_WORKSPACE_SID")
         self.US_SUPPORT_QUEUE_SID: Optional[str] = os.getenv("US_SUPPORT_QUEUE_SID")

@@ -1,17 +1,51 @@
 """Admin API routes for managing greetings, agents, and corrections."""
 
 from fastapi import APIRouter, HTTPException
+from backend.config import get_settings
 from pydantic import BaseModel
 from typing import Optional
 
 from backend.db import SessionLocal
 from backend.models.db_models import Agent, AgentSpecialization, MisheardCorrection, VoiceGreeting, VoicePrompt
 from backend.services import config_service
+from backend.services import gemini_service
 from backend.services.default_prompts import DEFAULT_GREETINGS, DEFAULT_IVR_PROMPTS
 from backend.services.logger import log_event
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+# ----------------- Authentication -----------------
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@router.post("/login")
+async def login(data: LoginRequest):
+    """Simple login endpoint that verifies credentials from env vars."""
+    settings = get_settings()
+    if data.username == settings.ADMIN_USERNAME and data.password == settings.ADMIN_PASSWORD:
+        return {"status": "ok"}
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+class DebugModerationRequest(BaseModel):
+    text: str
+
+
+@router.post("/debug/moderation")
+async def debug_moderation_endpoint(data: DebugModerationRequest):
+    """Run the moderation debug flow and return diagnostics (admin-only).
+
+    Returns the same dict as `backend.services.gemini_service.debug_moderation`.
+    """
+    try:
+        result = gemini_service.debug_moderation(data.text)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ==================== PYDANTIC MODELS ====================

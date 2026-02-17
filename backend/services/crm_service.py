@@ -142,15 +142,15 @@ def create_lead_in_crm(
         # - The caller-provided product (now a product *name*) is appended
         #   to Notes__c together with other captured context.
 
-        # Build notes payload
-        notes_pieces = []
+        # Build notes payload. Always include a Call flag.
+        notes_pieces = ["Call: true"]
         if category:
             notes_pieces.append(f"Category: {category}")
         if product_id:
             notes_pieces.append(f"Product: {product_id}")
         if description:
             notes_pieces.append(str(description))
-        notes_text = "\n\n".join([p for p in notes_pieces if p]) or None
+        notes_text = "\n\n".join([p for p in notes_pieces if p])
 
         lead_body = {
             "LastName": last_name,
