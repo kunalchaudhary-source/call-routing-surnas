@@ -48,6 +48,50 @@ VOICE_NAME = "Polly.Aditi"
 LANGUAGE_CODE = "en-IN"
 SPEECH_RECOGNITION_LANGUAGE = "en-IN"
 
+
+def say_slow(container, text: str, voice: str = VOICE_NAME, language: str = LANGUAGE_CODE, pause_len: float = 0.5):
+    """Speak `text` in smaller chunks with short pauses to sound slower and clearer.
+
+    `container` can be a `VoiceResponse` or `Gather` instance (both support `say` and `pause`).
+    """
+    if not text:
+        return
+    import re
+    # Normalize whitespace
+    t = re.sub(r"\s+", " ", text).strip()
+    # Split into sentence-like chunks first
+    chunks = re.split(r'(?<=[\.!?])\s+', t)
+    # Twilio <Pause> requires an integer `length`; ceil fractional seconds to the
+    # next integer to avoid invalid XML (Twilio will warn otherwise).
+    import math
+    try:
+        pause_int = math.ceil(pause_len)
+        if pause_int < 1:
+            pause_int = 1
+    except Exception:
+        pause_int = 1
+    for chunk in chunks:
+        if not chunk:
+            continue
+        # If chunk long, also split on commas for breath points
+        sub = [c.strip() for c in chunk.split(",") if c.strip()]
+        for piece in sub:
+            try:
+                container.say(piece, voice=voice, language=language)
+            except Exception:
+                # Fallback: try without voice/lang
+                try:
+                    container.say(piece)
+                except Exception:
+                    pass
+            # Insert a short pause to slow pacing
+            try:
+                container.pause(length=pause_int)
+            except Exception:
+                # some containers may not support pause; ignore
+                pass
+
+
 # The IVR only accepts these category values (speech synonyms are mapped to these).
 ALLOWED_IVR_CATEGORIES = (
     "necklace",
@@ -160,7 +204,7 @@ async def voice(request: Request) -> Response:
     
     # Say greeting
     greeting = config_service.get_voice_greeting(LANGUAGE_CODE)
-    response.say(greeting, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    say_slow(response, greeting, voice=VOICE_NAME, language=LANGUAGE_CODE)
     
     # Gather for intent selection (speech only, no DTMF required)
     gather = Gather(
@@ -175,11 +219,11 @@ async def voice(request: Request) -> Response:
     )
     menu_text = _get_prompt("menu")
     log_event(call_sid, "IVR_SAY", {"prompt": "menu", "message": menu_text})
-    gather.say(menu_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    say_slow(gather, menu_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
     response.append(gather)
     
     # If no input, reprompt
-    response.say(_get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
+    say_slow(response, _get_prompt("reprompt"), voice=VOICE_NAME, language=LANGUAGE_CODE)
     response.redirect("/voice")
     
     return Response(content=str(response), media_type="application/xml")
@@ -211,7 +255,7 @@ async def voice_intent(request: Request) -> Response:
 
         invalid_text = _get_prompt("invalid")
         log_event(call_sid, "IVR_SAY", {"prompt": "invalid", "message": invalid_text})
-        response.say(invalid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(response, invalid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
 
         gather = Gather(
             input="speech",
@@ -225,13 +269,13 @@ async def voice_intent(request: Request) -> Response:
         )
         menu_text = _get_prompt("menu")
         log_event(call_sid, "IVR_SAY", {"prompt": "menu", "message": menu_text})
-        gather.say(menu_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(gather, menu_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
 
         # If still no input, loop back to /voice
         reprompt_text = _get_prompt("reprompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
-        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(response, reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.redirect("/voice")
         return Response(content=str(response), media_type="application/xml")
 
@@ -252,7 +296,7 @@ async def voice_intent(request: Request) -> Response:
     )
     name_text = _get_prompt("name_prompt")
     log_event(call_sid, "IVR_SAY", {"prompt": "name_prompt", "message": name_text})
-    gather.say(name_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    say_slow(gather, name_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
     response.append(gather)
     
     # If no name provided, continue anyway
@@ -295,7 +339,7 @@ async def voice_name(request: Request) -> Response:
                 language=SPEECH_RECOGNITION_LANGUAGE,
                 timeout=8,
             )
-            gather.say(bad_name_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+            say_slow(gather, bad_name_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
             response.append(gather)
             # If still no valid name, fall back to name-fallback which continues the flow
             response.redirect("/voice/name-fallback")
@@ -349,13 +393,13 @@ async def _continue_after_name(call_sid: str, from_number: str | None) -> Respon
         )
         assist_text = _get_prompt("assist_type_prompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "assist_type_prompt", "message": assist_text})
-        gather.say(assist_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(gather, assist_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
         
         # If no input, reprompt and re-run this step (do not connect)
         reprompt_text = _get_prompt("reprompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
-        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(response, reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.redirect("/voice/name-fallback")
         return Response(content=str(response), media_type="application/xml")
 
@@ -372,13 +416,13 @@ async def _continue_after_name(call_sid: str, from_number: str | None) -> Respon
         )
         pid_text = _get_prompt("price_product_prompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "price_product_prompt", "message": pid_text})
-        gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(gather, pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
 
         # If no input, reprompt and re-run this step (do not connect)
         reprompt_text = _get_prompt("reprompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
-        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(response, reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.redirect("/voice/name-fallback")
         return Response(content=str(response), media_type="application/xml")
 
@@ -431,7 +475,7 @@ async def voice_assist_type(request: Request) -> Response:
         response = VoiceResponse()
         invalid_text = _get_prompt("invalid")
         log_event(call_sid, "IVR_SAY", {"prompt": "invalid", "message": invalid_text})
-        response.say(invalid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(response, invalid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
 
         gather = Gather(
             input="speech",
@@ -445,12 +489,12 @@ async def voice_assist_type(request: Request) -> Response:
         )
         assist_text = _get_prompt("assist_type_prompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "assist_type_prompt", "message": assist_text})
-        gather.say(assist_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(gather, assist_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
 
         reprompt_text = _get_prompt("reprompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
-        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(response, reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.redirect("/voice/name-fallback")
         return Response(content=str(response), media_type="application/xml")
 
@@ -472,13 +516,13 @@ async def voice_assist_type(request: Request) -> Response:
         )
         pid_text = _get_prompt("product_id_prompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "product_id_prompt", "message": pid_text})
-        gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(gather, pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
 
         # If no input, reprompt and retry
         reprompt_text = _get_prompt("reprompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
-        response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(response, reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.redirect("/voice/name-fallback")
         return Response(content=str(response), media_type="application/xml")
 
@@ -495,13 +539,13 @@ async def voice_assist_type(request: Request) -> Response:
     )
     cat_text = _get_prompt("category_prompt")
     log_event(call_sid, "IVR_SAY", {"prompt": "category_prompt", "message": cat_text})
-    gather.say(cat_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    say_slow(gather, cat_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
     response.append(gather)
     
     # If no input, reprompt and retry
     reprompt_text = _get_prompt("reprompt")
     log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text})
-    response.say(reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+    say_slow(response, reprompt_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
     response.redirect("/voice/name-fallback")
     return Response(content=str(response), media_type="application/xml")
 
@@ -606,12 +650,12 @@ async def voice_product_id(request: Request) -> Response:
         )
         pid_text = _get_prompt("product_id_prompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "product_id_prompt", "message": pid_text})
-        gather.say(pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(gather, pid_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.append(gather)
 
         reprompt_text_2 = _get_prompt("reprompt")
         log_event(call_sid, "IVR_SAY", {"prompt": "reprompt", "message": reprompt_text_2})
-        response.say(reprompt_text_2, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        say_slow(response, reprompt_text_2, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.redirect("/voice/product-id")
         return Response(content=str(response), media_type="application/xml")
 
