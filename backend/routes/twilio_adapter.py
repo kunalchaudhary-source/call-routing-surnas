@@ -36,6 +36,11 @@ async def error_log(request: Request):
 
 @router.post("/fallback")
 async def fallback(request: Request):
+    """Fallback webhook for Twilio: treat like an incoming call when primary
+    webhook fails. Logs the form and delegates to the main `voice` handler so
+    callers still receive IVR TwiML.
+    """
     form = await request.form()
     log_event(None, "TWILIO_FALLBACK", {"form": dict(form)})
-    return JSONResponse({"status": "ok"})
+    # Delegate to the main voice handler (same behavior as /incoming-call)
+    return await voice_endpoint(request)
