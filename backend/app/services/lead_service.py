@@ -1,11 +1,9 @@
-"""Utilities for capturing website context (lead/CRM metadata) per call."""
-
-from __future__ import annotations
+"""Utilities for capturing and tracking lead metadata during calls."""
 
 from typing import Any, Dict, Optional
 
-from backend.db import SessionLocal
-from backend.models.db_models import Call, CallLead
+from app.core.database import SessionLocal
+from app.models.db_models import Call, CallLead
 
 LANGUAGE_BY_CURRENCY = {
     "INR": "hi-IN",
@@ -13,7 +11,6 @@ LANGUAGE_BY_CURRENCY = {
     "EUR": "en-IN",
     "AED": "en-IN",
 }
-
 DEFAULT_LANGUAGE = "en-IN"
 
 
@@ -24,7 +21,7 @@ def _language_for_currency(currency: Optional[str]) -> str:
 
 
 def upsert_call_lead(payload: Dict[str, Any]) -> CallLead:
-    """Create or update a CallLead row with website-provided context."""
+    """Create or update a CallLead row with website or API provided context."""
     call_sid = payload["call_sid"]
     db = SessionLocal()
     try:
@@ -32,7 +29,6 @@ def upsert_call_lead(payload: Dict[str, Any]) -> CallLead:
         if not lead:
             lead = CallLead(call_sid=call_sid)
 
-        # Attach Call FK if record already exists
         if not lead.call_id:
             call = db.query(Call).filter_by(twilio_call_sid=call_sid).one_or_none()
             if call:
@@ -44,12 +40,11 @@ def upsert_call_lead(payload: Dict[str, Any]) -> CallLead:
         lead.user_type = payload.get("user_type", lead.user_type)
         lead.customer_id = payload.get("customer_id", lead.customer_id)
         lead.product_id = payload.get("product_id", lead.product_id)
-        # Important: website context updates should not wipe IVR-captured metadata
-        # (intent, caller_name, etc). Merge dictionaries and protect reserved keys.
+
+        # Protect reserved IVR keys during website context updates
         if "metadata" in payload and payload.get("metadata") is not None:
             incoming_meta = payload.get("metadata") or {}
             existing_meta = lead.extra_metadata or {}
-
             reserved_keys = {"intent", "caller_name", "assist_type", "caller_description"}
             merged = dict(existing_meta)
             for key, value in incoming_meta.items():
@@ -103,7 +98,6 @@ def record_category_selection(call_sid: str, category: str) -> Optional[CallLead
 
 
 def record_intent(call_sid: str, intent: str) -> Optional[CallLead]:
-    """Record the caller's top-level intent (general_inquiry / store / price_request)."""
     db = SessionLocal()
     try:
         lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
@@ -123,10 +117,6 @@ def record_intent(call_sid: str, intent: str) -> Optional[CallLead]:
 
 
 def record_assist_type(call_sid: str, assist_type: str) -> Optional[CallLead]:
-    """Record whether the caller wants help with a specific product or a category.
-
-    `assist_type` should be either 'product' or 'category'.
-    """
     db = SessionLocal()
     try:
         lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
@@ -146,18 +136,12 @@ def record_assist_type(call_sid: str, assist_type: str) -> Optional[CallLead]:
 
 
 def record_product_id(call_sid: str, product_id: str) -> Optional[CallLead]:
-    """Store the provided Product name on the call lead.
-
-    NOTE: the DB column is `product_id` but we reuse it to store the
-    human-friendly product name provided by the caller.
-    """
     db = SessionLocal()
     try:
         lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
         if not lead:
             lead = CallLead(call_sid=call_sid)
 
-        # Store the product name in the existing product_id column
         lead.product_id = product_id
         db.add(lead)
         db.commit()
@@ -168,7 +152,6 @@ def record_product_id(call_sid: str, product_id: str) -> Optional[CallLead]:
 
 
 def record_description(call_sid: str, description: str) -> Optional[CallLead]:
-    """Store a short free-text description the caller gave before handoff."""
     db = SessionLocal()
     try:
         lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
@@ -188,7 +171,6 @@ def record_description(call_sid: str, description: str) -> Optional[CallLead]:
 
 
 def record_caller_name(call_sid: str, caller_name: str) -> Optional[CallLead]:
-    """Store the caller's name (from IVR question)."""
     db = SessionLocal()
     try:
         lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
@@ -208,7 +190,6 @@ def record_caller_name(call_sid: str, caller_name: str) -> Optional[CallLead]:
 
 
 def get_caller_name(call_sid: str) -> Optional[str]:
-    """Retrieve the caller's name from the lead."""
     lead = get_lead_by_call_sid(call_sid)
     if lead and lead.extra_metadata:
         return lead.extra_metadata.get("caller_name")
@@ -216,7 +197,6 @@ def get_caller_name(call_sid: str) -> Optional[str]:
 
 
 def get_caller_intent(call_sid: str) -> Optional[str]:
-    """Retrieve the caller's intent from the lead."""
     lead = get_lead_by_call_sid(call_sid)
     if lead and lead.extra_metadata:
         return lead.extra_metadata.get("intent")
@@ -224,51 +204,10 @@ def get_caller_intent(call_sid: str) -> Optional[str]:
 
 
 def get_caller_description(call_sid: str) -> Optional[str]:
-    """Retrieve the caller's description from the lead."""
     lead = get_lead_by_call_sid(call_sid)
     if lead and lead.extra_metadata:
         return lead.extra_metadata.get("caller_description")
     return None
-
-
-def record_full_interaction(call_sid: str, *, intent: str | None = None, assist_type: str | None = None, product_id: str | None = None, product_category: str | None = None, description: str | None = None) -> Optional[CallLead]:
-    """Convenience helper to record multiple values at once on the CallLead.
-
-    Only non-None values are written.
-    """
-    db = SessionLocal()
-    try:
-        lead = db.query(CallLead).filter_by(call_sid=call_sid).one_or_none()
-        if not lead:
-            lead = CallLead(call_sid=call_sid)
-
-        if intent is not None:
-            extra = dict(lead.extra_metadata or {})
-            extra["intent"] = intent
-            lead.extra_metadata = extra
-
-        if assist_type is not None:
-            extra = dict(lead.extra_metadata or {})
-            extra["assist_type"] = assist_type
-            lead.extra_metadata = extra
-
-        if product_id is not None:
-            lead.product_id = product_id
-
-        if product_category is not None:
-            lead.selected_category = product_category.lower()
-
-        if description is not None:
-            extra = dict(lead.extra_metadata or {})
-            extra["caller_description"] = description
-            lead.extra_metadata = extra
-
-        db.add(lead)
-        db.commit()
-        db.refresh(lead)
-        return lead
-    finally:
-        db.close()
 
 
 def link_lead_to_call(call_sid: str, call_id: Optional[str]) -> None:

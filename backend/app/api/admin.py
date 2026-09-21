@@ -1,120 +1,94 @@
-"""Admin API routes for managing greetings, agents, and corrections."""
+"""Admin API routes for managing greetings, prompts, agents, settings, and corrections."""
 
+from typing import List, Optional
 from fastapi import APIRouter, HTTPException
-from backend.config import get_settings
 from pydantic import BaseModel
-from typing import Optional
 
-from backend.db import SessionLocal
-from backend.models.db_models import Agent, AgentSpecialization, MisheardCorrection, VoiceGreeting, VoicePrompt
-from backend.services import config_service
-from backend.services import gemini_service
-from backend.services.default_prompts import DEFAULT_GREETINGS, DEFAULT_IVR_PROMPTS
-from backend.services.logger import log_event
-
+from app.core.config import get_settings
+from app.core.database import SessionLocal
+from app.core.logger import log_event
+from app.models.db_models import (
+    Agent,
+    AgentSpecialization,
+    MisheardCorrection,
+    VoiceGreeting,
+    VoicePrompt,
+    AppSetting,
+)
+from app.models.schemas import (
+    LoginRequest,
+    DebugModerationRequest,
+    AgentCreate,
+    AgentUpdate,
+    SpecializationAdd,
+    CorrectionCreate,
+    GreetingUpdate,
+    IVRPromptUpdate,
+)
+from app.services import config_service, gemini_service
+from app.services.default_prompts import DEFAULT_GREETINGS, DEFAULT_IVR_PROMPTS
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-# ----------------- Authentication -----------------
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
+# ==================== AUTHENTICATION & DIAGNOSTICS ====================
 
 @router.post("/login")
 async def login(data: LoginRequest):
-    """Simple login endpoint that verifies credentials from env vars."""
     settings = get_settings()
     if data.username == settings.ADMIN_USERNAME and data.password == settings.ADMIN_PASSWORD:
         return {"status": "ok"}
     raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
-class DebugModerationRequest(BaseModel):
-    text: str
-
-
 @router.post("/debug/moderation")
 async def debug_moderation_endpoint(data: DebugModerationRequest):
-    """Run the moderation debug flow and return diagnostics (admin-only).
-
-    Returns the same dict as `backend.services.gemini_service.debug_moderation`.
-    """
     try:
-        result = gemini_service.debug_moderation(data.text)
-        return result
+        return gemini_service.debug_moderation(data.text)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ==================== PYDANTIC MODELS ====================
+# ==================== APP SETTINGS ====================
 
-class AgentCreate(BaseModel):
-    name: str
-    phone_number: str
-    region: str  # 'US', 'IN', 'GLOBAL'
-    is_default: bool = False
-    specializations: list[str] = []  # e.g., ['necklace', 'polki']
+class SettingUpdate(BaseModel):
+    value: str
 
 
-class AgentUpdate(BaseModel):
-    name: Optional[str] = None
-    phone_number: Optional[str] = None
-    region: Optional[str] = None
-    is_active: Optional[bool] = None
-    is_default: Optional[bool] = None
+@router.get("/settings")
+async def list_settings():
+    try:
+        config_service.refresh_cache()
+        settings_dict = getattr(config_service, "_cache", {}).get("settings", {})
+        return [{"key": k, "value": v} for k, v in settings_dict.items()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-class SpecializationAdd(BaseModel):
-    category: str
-    proficiency_level: int = 1  # 1=basic, 2=intermediate, 3=expert
+@router.get("/settings/{key}")
+async def get_setting(key: str):
+    val = config_service.get_setting(key)
+    if val is None:
+        raise HTTPException(status_code=404, detail="Setting not found")
+    return {"key": key, "value": val}
 
 
-class CorrectionCreate(BaseModel):
-    wrong_word: str
-    correct_word: str
-
-
-class GreetingUpdate(BaseModel):
-    message: str
-
-
-class IVRPromptUpdate(BaseModel):
-    message: str
-
-
-# ==================== GREETING ENDPOINTS ====================
-
-@router.get("/greetings")
-async def list_greetings():
-    """List all configured voice greetings."""
+@router.put("/settings/{key}")
+async def upsert_setting(key: str, data: SettingUpdate):
     db = SessionLocal()
     try:
-        greetings = db.query(VoiceGreeting).order_by(VoiceGreeting.language).all()
-        overrides = {g.language: g for g in greetings}
-
-        response = []
-        for language, default_message in DEFAULT_GREETINGS.items():
-            record = overrides.pop(language, None)
-            response.append({
-                "id": record.id if record else None,
-                "language": language,
-                "message": record.message if record else default_message,
-                "updated_at": record.updated_at if record else None,
-                "is_override": record is not None,
-            })
-
-        for remaining in sorted(overrides.values(), key=lambda g: g.language):
-            response.append({
-                "id": remaining.id,
-                "language": remaining.language,
-                "message": remaining.message,
-                "updated_at": remaining.updated_at,
-                "is_override": True,
-            })
-
-        return response
+        setting = db.query(AppSetting).filter_by(key=key).first()
+        if setting:
+            setting.value = data.value
+        else:
+            setting = AppSetting(key=key, value=data.value)
+            db.add(setting)
+        db.commit()
+        config_service.refresh_cache(force=True)
+        return {"status": "upserted", "key": key, "value": data.value}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
@@ -123,7 +97,6 @@ async def list_greetings():
 
 @router.get("/ivr-prompts")
 async def list_ivr_prompts():
-    """List all IVR prompt texts (menu, reprompt, confirmation, invalid)."""
     db = SessionLocal()
     try:
         prompts = db.query(VoicePrompt).order_by(VoicePrompt.key).all()
@@ -156,7 +129,6 @@ async def list_ivr_prompts():
 
 @router.get("/ivr-prompts/{key}")
 async def get_ivr_prompt_record(key: str):
-    """Fetch a specific IVR prompt by key (menu, reprompt, confirmation, invalid)."""
     db = SessionLocal()
     try:
         prompt = db.query(VoicePrompt).filter(VoicePrompt.key == key).first()
@@ -186,7 +158,6 @@ async def get_ivr_prompt_record(key: str):
 
 @router.put("/ivr-prompts/{key}")
 async def upsert_ivr_prompt(key: str, data: IVRPromptUpdate):
-    """Create or update an IVR prompt text for the given key."""
     if key not in DEFAULT_IVR_PROMPTS:
         raise HTTPException(status_code=400, detail="Invalid IVR prompt key")
 
@@ -215,7 +186,6 @@ async def upsert_ivr_prompt(key: str, data: IVRPromptUpdate):
 
 @router.delete("/ivr-prompts/{key}")
 async def delete_ivr_prompt(key: str):
-    """Delete an override for an IVR prompt (fallback default will be used)."""
     if key not in DEFAULT_IVR_PROMPTS:
         raise HTTPException(status_code=400, detail="Invalid IVR prompt key")
 
@@ -238,9 +208,42 @@ async def delete_ivr_prompt(key: str):
         db.close()
 
 
+# ==================== GREETING ENDPOINTS ====================
+
+@router.get("/greetings")
+async def list_greetings():
+    db = SessionLocal()
+    try:
+        greetings = db.query(VoiceGreeting).order_by(VoiceGreeting.language).all()
+        overrides = {g.language: g for g in greetings}
+
+        response = []
+        for language, default_message in DEFAULT_GREETINGS.items():
+            record = overrides.pop(language, None)
+            response.append({
+                "id": record.id if record else None,
+                "language": language,
+                "message": record.message if record else default_message,
+                "updated_at": record.updated_at if record else None,
+                "is_override": record is not None,
+            })
+
+        for remaining in sorted(overrides.values(), key=lambda g: g.language):
+            response.append({
+                "id": remaining.id,
+                "language": remaining.language,
+                "message": remaining.message,
+                "updated_at": remaining.updated_at,
+                "is_override": True,
+            })
+
+        return response
+    finally:
+        db.close()
+
+
 @router.get("/greetings/{language}")
 async def get_greeting(language: str):
-    """Fetch the greeting for a specific language."""
     db = SessionLocal()
     try:
         greeting = db.query(VoiceGreeting).filter(VoiceGreeting.language == language).first()
@@ -270,7 +273,6 @@ async def get_greeting(language: str):
 
 @router.put("/greetings/{language}")
 async def upsert_greeting(language: str, data: GreetingUpdate):
-    """Create or update a greeting for a language."""
     db = SessionLocal()
     try:
         greeting = db.query(VoiceGreeting).filter(VoiceGreeting.language == language).first()
@@ -296,7 +298,6 @@ async def upsert_greeting(language: str, data: GreetingUpdate):
 
 @router.delete("/greetings/{language}")
 async def delete_greeting(language: str):
-    """Delete a greeting override for a language (fallback will be used)."""
     db = SessionLocal()
     try:
         greeting = db.query(VoiceGreeting).filter(VoiceGreeting.language == language).first()
@@ -306,8 +307,7 @@ async def delete_greeting(language: str):
             config_service.refresh_cache(force=True)
             log_event(None, "GREETING_DELETED", {"language": language})
         else:
-            default_exists = language in DEFAULT_GREETINGS
-            if not default_exists:
+            if language not in DEFAULT_GREETINGS:
                 raise HTTPException(status_code=404, detail="Greeting not found")
 
         return {
@@ -324,7 +324,6 @@ async def delete_greeting(language: str):
 
 @router.get("/agents")
 async def list_agents():
-    """List all agents with their specializations."""
     db = SessionLocal()
     try:
         agents = db.query(Agent).order_by(Agent.region, Agent.name).all()
@@ -350,13 +349,12 @@ async def list_agents():
 
 @router.get("/agents/{agent_id}")
 async def get_agent(agent_id: int):
-    """Get a specific agent."""
     db = SessionLocal()
     try:
         agent = db.query(Agent).filter(Agent.id == agent_id).first()
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-        
+
         specs = db.query(AgentSpecialization).filter(AgentSpecialization.agent_id == agent.id).all()
         return {
             "id": agent.id,
@@ -376,7 +374,6 @@ async def get_agent(agent_id: int):
 
 @router.post("/agents")
 async def create_agent(data: AgentCreate):
-    """Create a new agent with optional specializations."""
     db = SessionLocal()
     try:
         agent = Agent(
@@ -387,9 +384,8 @@ async def create_agent(data: AgentCreate):
             is_active=True,
         )
         db.add(agent)
-        db.flush()  # Get agent.id
-        
-        # Add specializations
+        db.flush()
+
         for cat in data.specializations:
             spec = AgentSpecialization(
                 agent_id=agent.id,
@@ -397,12 +393,10 @@ async def create_agent(data: AgentCreate):
                 proficiency_level=1,
             )
             db.add(spec)
-        
+
         db.commit()
-        
         config_service.refresh_cache(force=True)
         log_event(None, "AGENT_CREATED", {"name": data.name, "region": data.region})
-        
         return {"status": "created", "agent_id": agent.id}
     finally:
         db.close()
@@ -410,13 +404,12 @@ async def create_agent(data: AgentCreate):
 
 @router.put("/agents/{agent_id}")
 async def update_agent(agent_id: int, data: AgentUpdate):
-    """Update an existing agent."""
     db = SessionLocal()
     try:
         agent = db.query(Agent).filter(Agent.id == agent_id).first()
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-        
+
         if data.name is not None:
             agent.name = data.name
         if data.phone_number is not None:
@@ -427,12 +420,10 @@ async def update_agent(agent_id: int, data: AgentUpdate):
             agent.is_active = data.is_active
         if data.is_default is not None:
             agent.is_default = data.is_default
-        
+
         db.commit()
-        
         config_service.refresh_cache(force=True)
         log_event(None, "AGENT_UPDATED", {"agent_id": agent_id})
-        
         return {"status": "updated", "agent_id": agent_id}
     finally:
         db.close()
@@ -440,19 +431,16 @@ async def update_agent(agent_id: int, data: AgentUpdate):
 
 @router.delete("/agents/{agent_id}")
 async def delete_agent(agent_id: int):
-    """Delete an agent (soft delete)."""
     db = SessionLocal()
     try:
         agent = db.query(Agent).filter(Agent.id == agent_id).first()
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-        
+
         agent.is_active = False
         db.commit()
-        
         config_service.refresh_cache(force=True)
         log_event(None, "AGENT_DELETED", {"agent_id": agent_id})
-        
         return {"status": "deleted", "agent_id": agent_id}
     finally:
         db.close()
@@ -460,19 +448,17 @@ async def delete_agent(agent_id: int):
 
 @router.post("/agents/{agent_id}/specializations")
 async def add_specialization(agent_id: int, data: SpecializationAdd):
-    """Add a specialization to an agent."""
     db = SessionLocal()
     try:
         agent = db.query(Agent).filter(Agent.id == agent_id).first()
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
-        
-        # Check if already exists
+
         existing = db.query(AgentSpecialization).filter(
             AgentSpecialization.agent_id == agent_id,
-            AgentSpecialization.category == data.category.lower()
+            AgentSpecialization.category == data.category.lower(),
         ).first()
-        
+
         if existing:
             existing.proficiency_level = data.proficiency_level
         else:
@@ -482,12 +468,10 @@ async def add_specialization(agent_id: int, data: SpecializationAdd):
                 proficiency_level=data.proficiency_level,
             )
             db.add(spec)
-        
+
         db.commit()
-        
         config_service.refresh_cache(force=True)
         log_event(None, "SPECIALIZATION_ADDED", {"agent_id": agent_id, "category": data.category})
-        
         return {"status": "added", "category": data.category}
     finally:
         db.close()
@@ -495,23 +479,20 @@ async def add_specialization(agent_id: int, data: SpecializationAdd):
 
 @router.delete("/agents/{agent_id}/specializations/{category}")
 async def remove_specialization(agent_id: int, category: str):
-    """Remove a specialization from an agent."""
     db = SessionLocal()
     try:
         spec = db.query(AgentSpecialization).filter(
             AgentSpecialization.agent_id == agent_id,
-            AgentSpecialization.category == category.lower()
+            AgentSpecialization.category == category.lower(),
         ).first()
-        
+
         if not spec:
             raise HTTPException(status_code=404, detail="Specialization not found")
-        
+
         db.delete(spec)
         db.commit()
-        
         config_service.refresh_cache(force=True)
         log_event(None, "SPECIALIZATION_REMOVED", {"agent_id": agent_id, "category": category})
-        
         return {"status": "removed", "category": category}
     finally:
         db.close()
@@ -521,7 +502,6 @@ async def remove_specialization(agent_id: int, category: str):
 
 @router.get("/corrections")
 async def list_corrections():
-    """List all misheard word corrections."""
     db = SessionLocal()
     try:
         corrections = db.query(MisheardCorrection).filter(MisheardCorrection.is_active == True).all()
@@ -539,7 +519,6 @@ async def list_corrections():
 
 @router.post("/corrections")
 async def create_correction(data: CorrectionCreate):
-    """Add a new misheard word correction."""
     db = SessionLocal()
     try:
         correction = MisheardCorrection(
@@ -549,10 +528,8 @@ async def create_correction(data: CorrectionCreate):
         )
         db.add(correction)
         db.commit()
-        
         config_service.refresh_cache(force=True)
         log_event(None, "CORRECTION_CREATED", {"wrong": data.wrong_word, "correct": data.correct_word})
-        
         return {"status": "created", "wrong_word": data.wrong_word}
     finally:
         db.close()
@@ -560,18 +537,15 @@ async def create_correction(data: CorrectionCreate):
 
 @router.delete("/corrections/{correction_id}")
 async def delete_correction(correction_id: int):
-    """Delete a correction."""
     db = SessionLocal()
     try:
         correction = db.query(MisheardCorrection).filter(MisheardCorrection.id == correction_id).first()
         if not correction:
             raise HTTPException(status_code=404, detail="Correction not found")
-        
+
         correction.is_active = False
         db.commit()
-        
         config_service.refresh_cache(force=True)
-        
         return {"status": "deleted"}
     finally:
         db.close()
@@ -580,15 +554,13 @@ async def delete_correction(correction_id: int):
 # ==================== CACHE MANAGEMENT ====================
 
 @router.post("/refresh-cache")
-async def refresh_cache():
-    """Force refresh the configuration cache."""
+async def refresh_cache_endpoint():
     config_service.refresh_cache(force=True)
     return {"status": "refreshed"}
 
 
 @router.get("/cache-status")
 async def cache_status():
-    """Get current cache status."""
     return {
         "greetings_count": len(config_service._cache.get("greetings", {})),
         "agents_count": len(config_service._cache.get("agents", [])),

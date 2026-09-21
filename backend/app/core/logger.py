@@ -1,11 +1,11 @@
-from datetime import datetime
-from typing import Any, Dict
+"""Structured event logging to stdout, python logger, and PostgreSQL database."""
+
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 import logging
 
-from backend.db import SessionLocal
-from backend.models.db_models import Call, CallEvent
+from app.core.database import SessionLocal
 
-# Configure module logger; uvicorn will capture these logs.
 logger = logging.getLogger("call_routing")
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -15,16 +15,13 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-def log_event(call_sid: str | None, event_type: str, payload: Dict[str, Any]) -> None:
-    """Persist a structured event for this call and log to stdout/logger.
+def log_event(call_sid: Optional[str], event_type: str, payload: Dict[str, Any]) -> None:
+    """Persist structured event for this call and log to stdout / python logging."""
+    from app.models.db_models import Call, CallEvent
 
-    Uses both print() (quick debug) and the Python logging module so messages
-    appear in uvicorn-managed logs and any log collectors.
-    """
     timestamp = datetime.utcnow().isoformat()
     now = datetime.utcnow()
 
-    # Prepare a record for console/log output (without DB timestamp)
     record = {
         "call_sid": call_sid,
         "event": event_type,
@@ -32,32 +29,28 @@ def log_event(call_sid: str | None, event_type: str, payload: Dict[str, Any]) ->
         "timestamp": timestamp,
     }
 
-    # DB log (Postgres) — avoid near-duplicate events caused by reloaders/processes
     db = SessionLocal()
     try:
         call = None
         if call_sid:
             call = db.query(Call).filter_by(twilio_call_sid=call_sid).one_or_none()
 
-        # Deduplicate: if an event with same type and payload was created in last 5s, skip it
+        # Deduplicate: if an event with same type and payload was created in last 5s, skip
         try:
-            from datetime import timedelta
-
             cutoff = now - timedelta(seconds=5)
-            q = db.query(CallEvent).filter(CallEvent.event_type == event_type, CallEvent.created_at >= cutoff)
+            q = db.query(CallEvent).filter(
+                CallEvent.event_type == event_type,
+                CallEvent.created_at >= cutoff,
+            )
             if call:
                 q = q.filter(CallEvent.call_id == call.id)
             if payload:
-                # JSONB contains operator: matches if stored JSON contains the given payload keys/values
                 q = q.filter(CallEvent.event_payload.contains(payload))
-            dup = q.first()
-            if dup:
+            if q.first():
                 return
         except Exception:
-            # If dedupe query fails for any reason, continue and log normally
             pass
 
-        # Emit via logging so uvicorn captures it consistently
         try:
             logger.info(record)
         except Exception:
@@ -73,10 +66,15 @@ def log_event(call_sid: str | None, event_type: str, payload: Dict[str, Any]) ->
         )
         db.add(event)
         db.commit()
+    except Exception as exc:
+        try:
+            logger.error(f"Error logging event to DB: {exc}")
+        except Exception:
+            pass
     finally:
         db.close()
 
 
-def log_system_failure(call_sid: str | None, source: str, error: str) -> None:
+def log_system_failure(call_sid: Optional[str], source: str, error: str) -> None:
     """Record a system failure related to a call for incident analysis."""
     log_event(call_sid, "SYSTEM_FAILURE", {"source": source, "error": error})

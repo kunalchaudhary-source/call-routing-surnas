@@ -1,14 +1,7 @@
-"""SQLAlchemy models for call/AI/routing analytics.
+"""SQLAlchemy ORM models for call routing, IVR analytics, agents, and prompts."""
 
-These correspond to the Postgres tables described in the design:
-- calls
-- call_events
-- routing_decisions
-- agent_assignments
-"""
-
-import uuid
 from datetime import datetime
+import uuid
 
 from sqlalchemy import (
     BigInteger,
@@ -24,7 +17,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
-from backend.db import Base
+from app.core.database import Base
 
 
 class Call(Base):
@@ -209,5 +202,17 @@ class VoicePrompt(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     key = Column(String(50), nullable=False, unique=True)  # e.g., 'menu', 'reprompt', 'confirmation', 'invalid'
     message = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AppSetting(Base):
+    """Key/value store for simple runtime settings editable via admin UI."""
+
+    __tablename__ = "app_settings"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    key = Column(String(100), nullable=False, unique=True)
+    value = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
